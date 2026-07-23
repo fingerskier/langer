@@ -1,13 +1,5 @@
 # LSP-MCP Bridge — Requirements Document
 
-**Version:** 0.1  
-**Status:** Draft  
-**Date:** 2026-07-22  
-**Author:** fingerskier (with Grok assistance)  
-**Related:** OpenClaw, nodeticket, personal AI agent stack, Claude Code / GrokBuild / Codex integrations
-
----
-
 ## 1. Overview
 
 ### 1.1 Purpose
