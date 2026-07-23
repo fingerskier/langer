@@ -1,382 +1,324 @@
-# LSP-MCP Bridge — Requirements Document
+# LSP-MCP Bridge — Technical Specification
 
-## 1. Overview
-
-### 1.1 Purpose
-Provide AI coding agents (Claude Code, GrokBuild, Codex, OpenClaw, etc.) with **compiler-grade semantic understanding** of source code via the Model Context Protocol (MCP).  
-
-Instead of relying on text search / grep / full-file reads, agents gain precise, language-aware tools for:
-- Go-to-definition / type definition
-- Find all references / callers / implementations
-- Hover (types + docs)
-- Document & workspace symbols
-- Diagnostics (errors, warnings)
-- Rename / code actions (with dry-run)
-- Call hierarchy & type hierarchy
-- Speculative / simulated edits
-
-The system is designed as a **standalone MCP server + long-running daemon** that can be plugged into any MCP-compatible client.
-
-### 1.2 Design Principles
-- **Agent-first** — tools expose high-level, token-efficient operations, not raw LSP JSON-RPC.
-- **Persistent** — warm index survives process restarts.
-- **Language-agnostic** — any LSP-compatible language server can be registered.
-- **Local-first / privacy-preserving** — no network required for core operation; all data stays on disk.
-- **Composable** — works as a pure MCP tool provider; optional deeper integration with Augment / OpenClaw later.
-- **Zero-config for common languages** — sensible defaults for TypeScript, Python, Rust, Go, etc.
-- **Lazy loading** - don't index everything automatically (can if the user wants, though);  just do the high-level and update pieces as the agent touches them or as code changes???
-
-### 1.3 Non-Goals (v0.1)
-- Full IDE replacement
-- Cloud / multi-user shared index
-- Building custom language servers
-- Heavy AI / embedding features (can be added later as optional layer)
+**Version:** 0.1  
+**Status:** Draft  
+**Date:** 2026-07-23
+**Related systems:** Claude Code, GrokBuild, Codex, OpenClaw
 
 ---
 
-## 2. Architecture
+## 1. Purpose
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  AI Client (Claude Code / GrokBuild / Codex / OpenClaw)     │
-│                                                             │
-│  MCP Client  ────────────────────────────────────────────┐  │
-└──────────────────────────────────────────────────────────│──┘
-                                                           │
-                                                           │ stdio / HTTP
-                                                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  LSP-MCP Bridge (MCP Server process)                        │
-│  - Tool registry & schema                                   │
-│  - Request routing                                          │
-│  - Speculative edit session manager                         │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             │ IPC / local socket
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Daemon (long-running)                                      │
-│  - Language Server lifecycle manager                        │
-│  - File watcher (inotify / FSEvents / etc.)                 │
-│  - Incremental indexer                                      │
-│  - SQLite index (system-level or per-user)                  │
-└─────────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Language Servers (gopls, rust-analyzer, pyright, tsserver…)│
-└─────────────────────────────────────────────────────────────┘
-```
+This document specifies the architecture, interfaces, data model, and behavior of the **LSP-MCP Bridge**.
 
-### 2.1 Components
+The system provides AI coding agents with compiler-accurate semantic code intelligence through the Model Context Protocol (MCP).
 
-| Component              | Responsibility                                                                 | Lifetime          |
-|------------------------|--------------------------------------------------------------------------------|-------------------|
-| **Daemon**             | Starts/stops language servers, watches filesystem, maintains warm SQLite index | System / user session |
-| **MCP Server**         | Exposes tools over MCP (stdio or HTTP), translates to daemon / LSP calls       | Per client connection |
-| **Index (SQLite)**     | Persistent store of files, symbols, references, diagnostics, hierarchies       | Durable           |
-| **Client Plugins**     | Thin adapters / config helpers for Claude Code, GrokBuild, Codex, etc.         | Optional          |
+Core design:
+
+> A long-running **daemon** owns language servers and a persistent index/cache.  
+> A thin **MCP server** provides the agent-facing tool interface and talks to the daemon on demand.
 
 ---
 
-## 3. Core Requirements
+## 2. High-Level Architecture
 
-### 3.1 Daemon
-- Runs as a background process (user-level by default; optional system service).
-- On start:
-  - Opens / creates the SQLite database.
-  - Loads registered language server configurations.
-  - Re-indexes or verifies existing workspace(s) if needed.
-  - Starts a file watcher on registered project roots.
-- Supports multiple concurrent workspaces / projects.
-- Graceful shutdown: flushes pending index writes, stops language servers cleanly.
-- Health endpoint / status command for clients.
+```
+┌──────────────────────────────────────────────────────────────┐
+│  AI Clients                                                  │
+│  (Claude Code / GrokBuild / Codex / OpenClaw / others)       │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ MCP (stdio or HTTP)
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│  MCP Server Process                                          │
+│  - Tool discovery & validation                               │
+│  - Request translation                                       │
+│  - Session / speculative edit management                     │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ Local IPC (Unix socket / named pipe)
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Daemon (long-running)                                       │
+│  - Language Server Manager                                   │
+│  - File Watcher                                              │
+│  - Indexer                                                   │
+│  - SQLite Index (persistent cache)                           │
+└────────────────────────────┬─────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Language Servers (gopls, rust-analyzer, pyright, tsserver…) │
+└──────────────────────────────────────────────────────────────┘
+```
 
-### 3.2 Index Persistence
-- **Must** use SQLite as the primary store.
-- Database location:
-  - Default: `$XDG_DATA_HOME/lsp-mcp/index.db` (or platform equivalent).
-  - Override via env `LSP_MCP_DB` or config.
-  - Optional per-project DBs under `<project>/.lsp-mcp/index.db`.
-- Supports incremental updates (file change → re-parse only affected files + dependents).
-- Schema must be versioned and migrateable.
+### 2.1 Component Responsibilities
+
+| Component       | Owns                                      | Does not own                          |
+|-----------------|-------------------------------------------|---------------------------------------|
+| **Daemon**      | Language servers, file watching, SQLite index, workspace state | MCP protocol, agent sessions         |
+| **MCP Server**  | MCP tool surface, request routing, speculative sessions | Language servers, persistent index   |
+
+The daemon is the source of truth for all semantic data. The MCP server is a pure access layer.
+
+---
+
+## 3. Daemon Specification
+
+### 3.1 Lifecycle
+
+- Started once (user-level preferred, optional system service later).
+- Survives individual MCP client disconnects.
+- On startup:
+  1. Open/create the SQLite database.
+  2. Load language server registry.
+  3. Restore known workspaces from the database.
+  4. Start file watchers for active workspaces.
+  5. Lazily start language servers only when needed.
+
+### 3.2 Multi-Repo Model
+
+The daemon supports **multiple workspaces** concurrently.
+
+- Each workspace is identified by its absolute root path.
+- Index data for all workspaces lives in a single system/user-level SQLite database (default).
+- Optional per-project databases are supported but not required for v0.1.
 
 ### 3.3 Language Server Management
-- Pluggable registry of language servers (command + args + file extensions + root markers).
-- Auto-detect common servers if binaries are on `$PATH`.
-- Lazy start: only launch a language server when a file of that language is opened.
-- Restart on crash with backoff.
-- Support for multi-root workspaces.
 
-### 3.4 MCP Interface
-- Transport: stdio (primary) + optional Streamable HTTP.
-- Full `tools/list` discovery with rich descriptions and JSON Schema.
-- Tools must be designed for low token usage (return structured, concise results).
-- Support for progress / partial results where useful (e.g. long-running workspace symbol search).
+- Language servers are started on demand when a file of the corresponding language is opened.
+- Configuration is declarative (name, command, args, file extensions, root markers).
+- The daemon monitors language server health and restarts on crash with exponential backoff.
+- Only one instance of a given language server is kept per workspace (or shared when safe).
 
----
+### 3.4 Indexing Behavior
 
-## 4. Base Suggested Tools (v0.1)
+- On first open of a workspace: full index (or resume from previous state).
+- Subsequent changes: incremental via file watcher + content-hash comparison.
+- Index stores: files, symbols, references, diagnostics, and basic hierarchy edges.
+- Language servers remain the authoritative source for live queries when the index is stale or incomplete.
 
-These form the **minimum viable** tool surface. Higher-level workflow tools can be layered later.
+### 3.5 Daemon API (Internal)
 
-### 4.1 Core Navigation & Intelligence
+The MCP server communicates with the daemon over a local socket using a simple request/response protocol (JSON or MessagePack).
 
-| Tool Name              | Description                                                                 | Key Parameters                          | Notes |
-|------------------------|-----------------------------------------------------------------------------|-----------------------------------------|-------|
-| `get_definition`       | Jump to definition of a symbol                                              | `file`, `line`, `character`             | Returns location(s) |
-| `get_type_definition`  | Jump to the type definition                                                 | `file`, `line`, `character`             |       |
-| `get_references`       | Find all references to a symbol                                             | `file`, `line`, `character`, `includeDeclaration?` |       |
-| `get_implementations`  | Find implementations of an interface / trait / abstract class               | `file`, `line`, `character`             |       |
-| `get_hover`            | Get type information + documentation at position                            | `file`, `line`, `character`             |       |
-| `document_symbols`     | Hierarchical outline of a single file                                       | `file`                                  |       |
-| `workspace_symbols`    | Search symbols across the workspace by name                                 | `query`, `limit?`                       | Fuzzy / subsequence |
-| `get_diagnostics`      | Get current diagnostics (errors/warnings) for a file or workspace           | `file?`                                 |       |
-| `call_hierarchy`       | Incoming / outgoing call hierarchy                                          | `file`, `line`, `character`, `direction` |       |
-| `type_hierarchy`       | Supertypes / subtypes                                                       | `file`, `line`, `character`             |       |
+Core daemon methods (conceptual):
 
-### 4.2 Editing & Refactoring
+```
+open_workspace(root_path) → workspace_id
+close_workspace(workspace_id)
 
-| Tool Name              | Description                                                                 | Key Parameters                          | Notes |
-|------------------------|-----------------------------------------------------------------------------|-----------------------------------------|-------|
-| `rename_symbol`        | Rename a symbol across the workspace (dry-run by default)                   | `file`, `line`, `character`, `newName`, `apply?` | Returns WorkspaceEdit |
-| `code_actions`         | Get available code actions / quick fixes at position                        | `file`, `line`, `character` (or range)  |       |
-| `format_document`      | Format a whole document or range                                            | `file`, `range?`                        |       |
-| `apply_edit`           | Apply a previously computed WorkspaceEdit                                   | `edit`                                  | Safety: confirm first |
+open_document(workspace_id, path, language_id?)
+close_document(workspace_id, path)
 
-### 4.3 Session / Index Management
+get_definition(workspace_id, path, line, character) → Location[]
+get_references(workspace_id, path, line, character) → Location[]
+get_hover(workspace_id, path, line, character) → Hover
+document_symbols(workspace_id, path) → Symbol[]
+workspace_symbols(workspace_id, query) → Symbol[]
+get_diagnostics(workspace_id, path?) → Diagnostic[]
 
-| Tool Name              | Description                                                                 | Key Parameters                          | Notes |
-|------------------------|-----------------------------------------------------------------------------|-----------------------------------------|-------|
-| `open_document`        | Notify the daemon that a file is open (triggers indexing if needed)         | `file`, `languageId?`                   |       |
-| `close_document`       | Notify that a file is closed                                                | `file`                                  |       |
-| `index_status`         | Report indexing progress / coverage for a workspace                         | `workspaceRoot?`                        |       |
-| `reindex`              | Force re-index of a file or entire workspace                                | `path?`                                 |       |
-| `list_language_servers`| Show currently running language servers and their status                    | —                                       |       |
-
-### 4.4 Speculative / Simulation (Nice-to-have for v0.1)
-
-| Tool Name              | Description                                                                 | Key Parameters                          | Notes |
-|------------------------|-----------------------------------------------------------------------------|-----------------------------------------|-------|
-| `simulate_edit`        | Apply an edit in-memory, return new diagnostics without touching disk       | `file`, `edits`                         | Critical for safe agent refactors |
-| `simulate_rename`      | Dry-run rename + impact analysis                                            | same as `rename_symbol`                 |       |
-
----
-
-## 5. SQLite Schema (v0.1)
-
-```sql
--- Schema version for migrations
-CREATE TABLE schema_version (
-  version INTEGER NOT NULL PRIMARY KEY
-);
-
--- Workspaces / projects
-CREATE TABLE workspaces (
-  id            INTEGER PRIMARY KEY,
-  root_path     TEXT NOT NULL UNIQUE,
-  name          TEXT,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  last_indexed  TEXT
-);
-
--- Source files
-CREATE TABLE files (
-  id            INTEGER PRIMARY KEY,
-  workspace_id  INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  path          TEXT NOT NULL,                  -- relative to workspace root
-  absolute_path TEXT NOT NULL,
-  language_id   TEXT,
-  content_hash  TEXT,                           -- for change detection
-  size_bytes    INTEGER,
-  mtime         REAL,                           -- filesystem mtime
-  last_indexed  TEXT,
-  UNIQUE(workspace_id, path)
-);
-
-CREATE INDEX idx_files_workspace ON files(workspace_id);
-CREATE INDEX idx_files_hash ON files(content_hash);
-
--- Symbols (functions, classes, variables, etc.)
-CREATE TABLE symbols (
-  id            INTEGER PRIMARY KEY,
-  file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  name          TEXT NOT NULL,
-  kind          INTEGER NOT NULL,               -- LSP SymbolKind
-  detail        TEXT,                           -- signature / type string
-  start_line    INTEGER NOT NULL,
-  start_col     INTEGER NOT NULL,
-  end_line      INTEGER NOT NULL,
-  end_col       INTEGER NOT NULL,
-  container_name TEXT,                          -- enclosing class/module
-  documentation TEXT
-);
-
-CREATE INDEX idx_symbols_name ON symbols(name);
-CREATE INDEX idx_symbols_file ON symbols(file_id);
-CREATE INDEX idx_symbols_kind ON symbols(kind);
-
--- References / usages
-CREATE TABLE references (
-  id            INTEGER PRIMARY KEY,
-  symbol_id     INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-  file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  start_line    INTEGER NOT NULL,
-  start_col     INTEGER NOT NULL,
-  end_line      INTEGER NOT NULL,
-  end_col       INTEGER NOT NULL,
-  is_definition INTEGER NOT NULL DEFAULT 0      -- 1 if this is the defining occurrence
-);
-
-CREATE INDEX idx_refs_symbol ON references(symbol_id);
-CREATE INDEX idx_refs_file ON references(file_id);
-
--- Diagnostics (errors, warnings, hints)
-CREATE TABLE diagnostics (
-  id            INTEGER PRIMARY KEY,
-  file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  severity      INTEGER NOT NULL,               -- 1=Error, 2=Warning, 3=Info, 4=Hint
-  message       TEXT NOT NULL,
-  code          TEXT,
-  source        TEXT,                           -- language server name
-  start_line    INTEGER NOT NULL,
-  start_col     INTEGER NOT NULL,
-  end_line      INTEGER NOT NULL,
-  end_col       INTEGER NOT NULL,
-  recorded_at   TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX idx_diag_file ON diagnostics(file_id);
-
--- Simple key-value for daemon state / metadata
-CREATE TABLE meta (
-  key           TEXT PRIMARY KEY,
-  value         TEXT
-);
-
--- Optional: call hierarchy edges (can be computed on demand initially)
-CREATE TABLE call_edges (
-  id            INTEGER PRIMARY KEY,
-  from_symbol   INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-  to_symbol     INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
-  UNIQUE(from_symbol, to_symbol)
-);
+rename_symbol(...) → WorkspaceEdit
+simulate_edit(...) → Diagnostics + preview
+index_status(workspace_id) → Status
 ```
 
-**Notes on schema:**
-- Keep it lean for v0.1. Full call graphs and type hierarchies can be materialised later or computed live from language servers.
-- Use `content_hash` (SHA-256 of file contents) for cheap change detection.
-- All timestamps are ISO-8601 UTC strings for simplicity.
+Exact wire format will be defined during implementation (prefer a small typed RPC layer).
 
 ---
 
-## 6. Client / Plugin Integration
+## 4. MCP Server Specification
 
-### 6.1 Claude Code
-- Provide a one-liner install / register command:
-  ```bash
-  claude mcp add lsp-mcp -- <path-to-binary> --stdio
-  ```
-- Or a small helper script that writes the correct entry into `~/.claude.json` / project `.mcp.json`.
-- Optional Claude Code plugin that auto-detects the daemon and surfaces status.
+### 4.1 Transport
 
-### 6.2 GrokBuild
-- Compatible via standard MCP config (`~/.grok/mcp.json` or project equivalent).
-- Provide a `grok mcp add lsp-mcp ...` style helper if the CLI supports it.
+- **Primary:** stdio (compatible with Claude Code, GrokBuild, Codex, etc.)
+- **Secondary:** Streamable HTTP (optional, for remote or multi-client scenarios)
 
-### 6.3 Codex / other MCP clients
-- Document the standard MCP server launch command + environment variables.
-- Supply a JSON snippet for common clients.
+### 4.2 Tool Surface (Base Set)
 
-### 6.4 OpenClaw / Augment Integration (future)
-- Optional deeper hooks: shared memory directory, automatic project registration, status surface inside OpenClaw UI.
+#### Navigation & Intelligence
+
+| Tool                    | Purpose                                      |
+|-------------------------|----------------------------------------------|
+| `get_definition`        | Go to definition                             |
+| `get_type_definition`   | Go to type definition                        |
+| `get_references`        | Find all references                          |
+| `get_implementations`   | Find implementations                         |
+| `get_hover`             | Type + documentation at position             |
+| `document_symbols`      | Hierarchical outline of a file               |
+| `workspace_symbols`     | Fuzzy search across workspace                |
+| `get_diagnostics`       | Current errors/warnings                      |
+| `call_hierarchy`        | Incoming / outgoing calls                    |
+| `type_hierarchy`        | Super/sub types                              |
+
+#### Editing
+
+| Tool                    | Purpose                                      |
+|-------------------------|----------------------------------------------|
+| `rename_symbol`         | Rename (dry-run by default)                  |
+| `code_actions`          | Available quick fixes / actions              |
+| `format_document`       | Format file or range                         |
+| `apply_edit`            | Apply a previously computed edit             |
+
+#### Session & Index
+
+| Tool                    | Purpose                                      |
+|-------------------------|----------------------------------------------|
+| `open_document`         | Notify daemon a file is active               |
+| `close_document`        | Notify daemon a file is closed               |
+| `index_status`          | Report indexing progress / coverage          |
+| `reindex`               | Force re-index of path or workspace          |
+| `list_language_servers` | Show running language servers                |
+
+#### Speculative (Recommended for v0.1)
+
+| Tool                    | Purpose                                      |
+|-------------------------|----------------------------------------------|
+| `simulate_edit`         | Apply edit in memory, return new diagnostics |
+| `simulate_rename`       | Dry-run rename with impact analysis          |
+
+All tools must return concise, structured results optimized for low token usage.
+
+### 4.3 Tool Design Rules
+
+- Prefer absolute or workspace-relative paths consistently.
+- Positions use 0-based or 1-based line/character according to LSP convention (document clearly).
+- Dry-run is the default for any mutating operation.
+- Tools that can be expensive (`workspace_symbols`, full reindex) should support limits and progress where possible.
 
 ---
 
-## 7. Configuration
+## 5. Data Model (SQLite)
 
-Primary config file: `~/.config/lsp-mcp/config.toml` (or XDG equivalent).
+The daemon maintains a single primary SQLite database.
+
+### 5.1 Core Tables
+
+```sql
+schema_version (version)
+
+workspaces (
+  id, root_path, name, created_at, last_indexed
+)
+
+files (
+  id, workspace_id, path, absolute_path,
+  language_id, content_hash, size_bytes, mtime, last_indexed
+)
+
+symbols (
+  id, file_id, name, kind, detail,
+  start_line, start_col, end_line, end_col,
+  container_name, documentation
+)
+
+references (
+  id, symbol_id, file_id,
+  start_line, start_col, end_line, end_col,
+  is_definition
+)
+
+diagnostics (
+  id, file_id, severity, message, code, source,
+  start_line, start_col, end_line, end_col, recorded_at
+)
+
+meta (key, value)
+
+-- optional
+call_edges (from_symbol, to_symbol)
+```
+
+### 5.2 Indexing Strategy
+
+- Content hash (SHA-256) used for change detection.
+- On file change: remove old symbols/references for that file, re-query language server, insert new data.
+- Diagnostics are refreshed more aggressively (on open / after edit).
+
+---
+
+## 6. Configuration
+
+Default locations follow XDG conventions:
+
+- Config: `~/.config/lsp-mcp/config.toml`
+- Database: `~/.local/share/lsp-mcp/index.db`
+- Socket: `~/.local/share/lsp-mcp/daemon.sock`
+
+Example language server entry:
 
 ```toml
-[daemon]
-db_path = "~/.local/share/lsp-mcp/index.db"
-log_level = "info"
-
 [[language_servers]]
 name = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
 file_extensions = [".ts", ".tsx", ".js", ".jsx"]
 root_markers = ["tsconfig.json", "package.json"]
-
-[[language_servers]]
-name = "python"
-command = "pyright-langserver"
-args = ["--stdio"]
-file_extensions = [".py"]
-root_markers = ["pyproject.toml", "setup.py"]
-
-# ... more servers
 ```
 
-Environment overrides:
-- `LSP_MCP_DB`
-- `LSP_MCP_CONFIG`
-- `LSP_MCP_LOG_LEVEL`
+Environment overrides are supported for database path, config path, and log level.
 
 ---
 
-## 8. Non-Functional Requirements
+## 7. Client Integration
 
-| Area              | Requirement                                      |
-|-------------------|--------------------------------------------------|
-| **Performance**   | Index updates for a single file < 500 ms on typical hardware; workspace symbol search interactive |
-| **Languages**     | v0.1: TypeScript/JS, Python, Rust, Go, Markdown (via Marksman). Expand rapidly. |
-| **Reliability**   | Language server crashes must not take down the daemon |
-| **Security**      | No network by default; SQLite file permissions; no execution of arbitrary code beyond configured LS binaries |
-| **Footprint**     | Daemon idle memory < 100 MB when few projects open |
-| **Portability**   | Linux (primary), macOS, Windows (later) |
+### 7.1 Claude Code
+```bash
+claude mcp add lsp-mcp -- /path/to/lsp-mcp --stdio
+```
 
----
+### 7.2 GrokBuild / Codex
+Standard MCP configuration pointing at the same binary in stdio mode.
 
-## 9. Implementation Phases (Suggested)
-
-1. **MVP**  
-   - Daemon + SQLite + basic file indexer  
-   - 6–8 core tools (definition, references, hover, symbols, diagnostics)  
-   - TypeScript + Python support  
-   - stdio MCP server  
-
-2. **v0.2**  
-   - Rename + code actions + simulate_edit  
-   - More languages (Rust, Go)  
-   - File watcher + incremental updates  
-
-3. **v0.3**  
-   - Call hierarchy, type hierarchy  
-   - Claude / GrokBuild convenience plugins  
-   - Speculative session support  
-
-4. **Later**  
-   - Optional embedding layer for semantic search  
-   - Shared index with Augment / OpenClaw  
-   - HTTP transport + remote access (opt-in)
+### 7.3 OpenClaw / Augment
+The MCP server can be registered like any other tool provider. Deeper coupling (shared project registration, status surface) is deferred.
 
 ---
 
-## 10. Open Questions
+## 8. Process Model & Isolation
 
-- Exact binary name / packaging (`lsp-mcp`, `symbol-bridge`, `code-intel-mcp`…)?
-- Should the daemon be user-level only, or also support a system service?
-- How aggressively should we cache call graphs vs. query language servers live?
-- Prefer Rust, Go, or TypeScript for the core implementation?
+- The daemon runs independently of any MCP client.
+- Multiple MCP clients may connect to the same daemon concurrently.
+- Language server processes are children of the daemon and are cleaned up on daemon shutdown.
+- A language server crash must not terminate the daemon or the MCP server.
 
 ---
 
-**Next Actions**
-1. Decide on name + language.
-2. Scaffold the SQLite schema + migration runner.
-3. Implement a minimal daemon that can start one language server and answer `get_definition` / `get_hover`.
-4. Expose those as MCP tools and test with Claude Code.
+## 9. Security Considerations
 
-This document is intentionally lightweight and actionable. Refine as implementation begins.
+- No network access required for core operation.
+- Database and socket files should have restrictive permissions (user-only).
+- The daemon only executes language server binaries that are explicitly configured.
+- Mutating tools default to dry-run / require explicit apply.
+
+---
+
+## 10. Implementation Notes (Guidance)
+
+Recommended implementation language: **Rust** or **Go** for the daemon + MCP server (single binary preferred).
+
+Suggested structure:
+
+```
+lsp-mcp/
+├── daemon/          # long-running process
+├── mcp/             # MCP server frontend
+├── index/           # SQLite schema + queries
+├── lsp/             # language server client wrapper
+└── protocol/        # shared IPC types
+```
+
+The same binary can support both `daemon` and `mcp` subcommands.
+
+---
+
+## 11. Success Criteria (v0.1)
+
+- Can open a TypeScript or Python project and answer `get_definition`, `get_references`, and `get_hover` correctly via MCP.
+- Index survives daemon restart.
+- File changes are reflected incrementally without full re-index.
+- Claude Code and GrokBuild can both use the same MCP server entry.
+- Speculative edit returns accurate diagnostics without writing to disk.
+
+---
+
+**End of Specification**
