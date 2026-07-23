@@ -24,6 +24,7 @@ The system is designed as a **standalone MCP server + long-running daemon** that
 - **Local-first / privacy-preserving** — no network required for core operation; all data stays on disk.
 - **Composable** — works as a pure MCP tool provider; optional deeper integration with Augment / OpenClaw later.
 - **Zero-config for common languages** — sensible defaults for TypeScript, Python, Rust, Go, etc.
+- **Lazy loading** - don't index everything automatically (can if the user wants, though);  just do the high-level and update pieces as the agent touches them or as code changes???
 
 ### 1.3 Non-Goals (v0.1)
 - Full IDE replacement
