@@ -1,2 +1,2 @@
-# lang-ai-plugin
+# langer
 LSP MCP service for search and indexing
