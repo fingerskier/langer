@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/protocol"
@@ -15,15 +17,18 @@ import (
 func TestLivenessLockIsExclusive(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "daemon.lock")
 
-	first, err := acquireLiveness(path)
+	first, err := acquireLiveness(context.Background(), path, 0)
 	if err != nil {
 		t.Fatalf("acquireLiveness: %v", err)
 	}
 
-	if _, err := acquireLiveness(path); err == nil {
+	if _, err := acquireLiveness(context.Background(), path, 20*time.Millisecond); err == nil {
 		t.Fatal("a second holder acquired the same liveness lock")
-	} else if code := protocol.AsError(err).Code; code != protocol.ErrInternal {
-		t.Errorf("a contended lock reported %s, want a structured error", code)
+	} else if code := protocol.AsError(err).Code; code != protocol.ErrNotReady {
+		// NOT_READY, not INTERNAL: SPEC §3.6 reserves INTERNAL for "bug in the
+		// bridge", and a workspace whose previous daemon has not finished
+		// standing down is a retryable condition, not a defect.
+		t.Errorf("a contended lock reported %s, want %s", code, protocol.ErrNotReady)
 	}
 
 	if err := first.release(); err != nil {
@@ -32,12 +37,126 @@ func TestLivenessLockIsExclusive(t *testing.T) {
 
 	// After release the lock is available again — a daemon that exits cleanly
 	// must not poison its workspace.
-	second, err := acquireLiveness(path)
+	second, err := acquireLiveness(context.Background(), path, 0)
 	if err != nil {
 		t.Fatalf("the lock was not released: %v", err)
 	}
 	if err := second.release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestLivenessLockWaitsForTheOutgoingDaemon is SPEC §3.1's drain-and-restart,
+// reduced to the one fact the whole sequence turns on.
+//
+// A drain ack means "I have STARTED standing down". The old daemon still has
+// to finish in-flight work, let the answers land, and tear its language servers
+// down — up to ~17 s by the bounds in server.go — before its lock drops. The
+// replacement is spawned immediately, so it ALWAYS arrives inside that window.
+// Failing on the first EWOULDBLOCK made it exit; daemonctl.Connect spawns
+// exactly once, so the workspace was then left with no daemon at all until the
+// agent happened to retry.
+func TestLivenessLockWaitsForTheOutgoingDaemon(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+
+	outgoing, err := acquireLiveness(context.Background(), path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const teardown = 400 * time.Millisecond
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(teardown)
+		close(released)
+		_ = outgoing.release()
+	}()
+
+	start := time.Now()
+	replacement, err := acquireLiveness(context.Background(), path, 10*time.Second)
+	if err != nil {
+		t.Fatalf("the replacement daemon gave up while its predecessor was still shutting down: %v", err)
+	}
+	defer replacement.release()
+
+	select {
+	case <-released:
+	default:
+		t.Fatal("the lock was acquired before the outgoing holder released it")
+	}
+	if elapsed := time.Since(start); elapsed < teardown {
+		t.Errorf("waited %v for a lock released after %v", elapsed, teardown)
+	}
+}
+
+// TestLivenessLockGivesUpOnAHealthyDaemon: the wait is bounded. A second
+// daemon for a workspace that already has a live one must be told so, with a
+// retryable code, rather than blocking forever.
+func TestLivenessLockGivesUpOnAHealthyDaemon(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+
+	held, err := acquireLiveness(context.Background(), path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.release()
+
+	start := time.Now()
+	_, err = acquireLiveness(context.Background(), path, 150*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("two daemons hold the same workspace lock")
+	}
+	got := protocol.AsError(err)
+	if got.Code != protocol.ErrNotReady {
+		t.Errorf("code = %s (%s), want %s", got.Code, got.Message, protocol.ErrNotReady)
+	}
+	if got.RetryAfterMS <= 0 {
+		t.Error("a NOT_READY without a retry hint tells the caller nothing about when to try again")
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("gave up after %v, before the %v wait elapsed", elapsed, 150*time.Millisecond)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("the wait is not bounded: %v", elapsed)
+	}
+}
+
+// TestLivenessLockWaitIsCancellable: a daemon parked waiting for a predecessor
+// must still die on SIGTERM. A blocking flock cannot be interrupted by a
+// context, which is why this polls.
+func TestLivenessLockWaitIsCancellable(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+
+	held, err := acquireLiveness(context.Background(), path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := acquireLiveness(ctx, path, time.Hour)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the cancelled wait acquired the lock")
+		}
+		if code := protocol.AsError(err).Code; code != protocol.ErrNotReady {
+			t.Errorf("a cancelled wait reported %s, want %s", code, protocol.ErrNotReady)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelling the context did not end the wait")
 	}
 }
 
@@ -47,7 +166,7 @@ func TestLivenessLockIsExclusive(t *testing.T) {
 func TestLivenessLockFileSurvivesRelease(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "daemon.lock")
 
-	lock, err := acquireLiveness(path)
+	lock, err := acquireLiveness(context.Background(), path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +186,7 @@ func TestLivenessLockIsUserOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lock, err := acquireLiveness(path)
+	lock, err := acquireLiveness(context.Background(), path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

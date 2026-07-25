@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -473,16 +474,176 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	return raw
 }
 
+// ---- a slow or oversized reply must not become everyone else's problem -----
+
+// lspSymbols builds a documentSymbol result of roughly the requested size, by
+// padding symbol names. It is how a "workspace_symbols on a monorepo" sized
+// payload is produced without a monorepo.
+func lspSymbols(count, nameLen int) string {
+	name := strings.Repeat("s", nameLen)
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < count; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"name":"` + name + `","kind":13,` +
+			`"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},` +
+			`"selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}`)
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+// TestASlowPeerDoesNotStarveOtherClients: one client that stops reading must
+// not be able to pin the daemon's shared capacity.
+//
+// handle holds its MaxInFlight slot AND the sunset's in-flight count across the
+// socket write, and the write had no deadline. Once a peer's receive buffer
+// filled, that Write never returned: the slot was pinned for the life of the
+// process, every other MCP client on the workspace was answered "daemon is at
+// its N request limit" for ever — a lie, since the daemon is not busy, it is
+// wedged — and the SPEC §3.1 idle sunset could never fire either, because
+// untilIdle and tryIdleDrain both refuse while inflight > 0.
+func TestASlowPeerDoesNotStarveOtherClients(t *testing.T) {
+	// Comfortably past any socket buffer, comfortably inside MaxFrameBytes.
+	big := lspSymbols(2000, 2000)
+
+	// hold keeps the deaf peer's query inside the fake language server until
+	// this test lets it go. That is what makes "the daemon's only slot is now
+	// occupied" a fact rather than a race: without it the test could reach its
+	// assertions before the request it is about had even started.
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	h := startDaemon(t, func(o *Options) {
+		o.MaxInFlight = 1
+		o.WriteTimeout = 500 * time.Millisecond
+	}, func(_ string, _ int, s *fakeSession) {
+		s.symbols = big
+		s.hold = hold
+		s.entered = entered
+	})
+
+	good, ws := h.session("alice")
+
+	// A peer that asks for a large result and then never reads a byte.
+	conn, err := net.DialTimeout("unix", h.srv.SocketPath(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deaf := protocol.NewCodec(conn)
+	if err := deaf.WriteRequest(protocol.NewRequest(1, protocol.MethodDocumentSymbols,
+		mustJSON(t, protocol.DocumentParams{Session: "deaf", Workspace: ws, Path: "src/user.ts"}))); err != nil {
+		t.Fatal(err)
+	}
+
+	status := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := good.IndexStatus(ctx, protocol.IndexStatusParams{Session: "alice", Workspace: ws})
+		return err
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		close(hold)
+		t.Fatal("the deaf peer's query never reached the language server")
+	}
+
+	// Arming check: with the one slot held, everybody else is refused. This is
+	// legitimate backpressure (docs §6.9) and it is what the starvation later
+	// becomes indistinguishable from.
+	if err := status(); err == nil || protocol.AsError(err).Code != protocol.ErrNotReady {
+		close(hold)
+		t.Fatalf("with the only slot held, another client got %v; want NOT_READY", err)
+	}
+
+	// Release it. The language server answers 4 MB, the deaf peer never reads,
+	// and the daemon's write blocks — holding the slot AND the sunset's
+	// in-flight count while it does.
+	close(hold)
+
+	// It must now recover on its own. A peer that stopped reading is the
+	// daemon's problem to shed, not every other client's to wait out for ever.
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = status()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("a client that stopped reading starved every other client for 15s; last answer: %v", lastErr)
+}
+
+// TestAnOversizeResultIsReportedNotDropped: a result too big for one IPC frame
+// must come back as a structured refusal.
+//
+// reply swallowed the codec's refusal into a Debug log line and returned, so no
+// response was ever written for that request id. The caller waited out its full
+// deadline and daemonctl rendered that as NOT_READY — telling the agent to
+// retry a query that will fail identically every single time. The LSP framer
+// accepts 32 MiB while the IPC codec caps at 8, so the whole 8-32 MiB band of
+// real language-server payloads lands here.
+func TestAnOversizeResultIsReportedNotDropped(t *testing.T) {
+	// ~10 MiB of symbols: past MaxFrameBytes, inside the LSP framer's cap.
+	huge := lspSymbols(400, 25000)
+
+	h := startDaemon(t, nil, func(_ string, _ int, s *fakeSession) {
+		s.symbols = huge
+	})
+
+	client, ws := h.session("alice")
+
+	// A deadline far longer than the query needs: if the daemon answers, this
+	// returns at once, and if it stays silent the deadline is what we see.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := client.DocumentSymbols(ctx, protocol.DocumentParams{
+		Session: "alice", Workspace: ws, Path: "src/user.ts",
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a result over the frame limit was reported as a success")
+	}
+	if elapsed > 15*time.Second {
+		t.Errorf("no response was written at all: the caller waited out its own %v deadline", elapsed)
+	}
+	got := protocol.AsError(err)
+	if got.Code != protocol.ErrInternal {
+		t.Errorf("an oversize result gave %s (%s), want %s", got.Code, got.Message, protocol.ErrInternal)
+	}
+	if !strings.Contains(got.Message, "frame") {
+		t.Errorf("the refusal %q does not say the result did not fit; the agent cannot tell why", got.Message)
+	}
+}
+
 // ---- acceptance: version mismatch drains and restarts ----------------------
 
 // TestVersionMismatchDrainsTheStaleDaemonAndStartsAFreshOne is SPEC §3.1's
 // "if the MCP server detects a daemon/binary version mismatch, it asks the old
 // daemon to drain and restarts it".
+//
+// The predecessor holds the workspace's liveness flock for a while AFTER
+// acknowledging the drain, which is what a real one does: the ack is the start
+// of docs §6.5's teardown, not the end of it, and a busy tsserver alone can
+// take seconds to stop. The replacement is spawned inside that window every
+// time. It used to give up on the first EWOULDBLOCK and exit, and since
+// daemonctl.Connect spawns exactly once, the workspace was then left with NO
+// daemon until an agent happened to retry — a permanent denial of service from
+// a perfectly ordinary shutdown.
 func TestVersionMismatchDrainsTheStaleDaemonAndStartsAFreshOne(t *testing.T) {
 	cfg := testConfig(t)
 	root := fixtureRoot(t)
 
-	stale := startStaleDaemon(t, cfg, root)
+	stale := startStaleDaemon(t, cfg, root, 1500*time.Millisecond)
 
 	// A runner that "spawns" a real, current-version daemon in-process.
 	spawner := newSpawningRunner(t, cfg, root)
@@ -517,15 +678,38 @@ func TestVersionMismatchDrainsTheStaleDaemonAndStartsAFreshOne(t *testing.T) {
 }
 
 // staleDaemon is a daemon from an older build: it speaks a different protocol
-// version and knows how to drain.
+// version, knows how to drain, and — like every real daemon — HOLDS THE
+// WORKSPACE'S LIVENESS FLOCK for its whole life.
+//
+// The lock is the part that matters. A fake that answers a drain and vanishes
+// tests nothing: the replacement it provokes finds an empty workspace and
+// starts trivially. A real daemon acks the drain and then spends up to ~17 s
+// finishing in-flight work and tearing its language servers down, holding the
+// lock the entire time (docs/ARCHITECTURE.md §6.5, §6.8), and it is the
+// replacement's behaviour INSIDE that window that SPEC §3.1's drain-and-restart
+// actually depends on.
 type staleDaemon struct {
 	listener net.Listener
 	socket   string
+	lock     *livenessLock
+	teardown time.Duration
 	sawDrain atomic.Bool
 	done     chan struct{}
+	// letGo makes releasing idempotent: the simulated teardown drops the lock
+	// on a timer and the cleanup drops it again, and livenessLock.release is
+	// written for the single caller Run gives it, not for two racing ones.
+	letGo sync.Once
 }
 
-func startStaleDaemon(t *testing.T, cfg *config.Config, root string) *staleDaemon {
+// release drops the liveness lock, once, whoever asks first.
+func (d *staleDaemon) release() {
+	d.letGo.Do(func() { _ = d.lock.release() })
+}
+
+// startStaleDaemon starts the predecessor. teardown is how long it keeps the
+// liveness lock after acknowledging a drain, standing in for its language
+// server shutdown.
+func startStaleDaemon(t *testing.T, cfg *config.Config, root string, teardown time.Duration) *staleDaemon {
 	t.Helper()
 	if _, err := cfg.EnsureRuntimeDir(); err != nil {
 		t.Fatal(err)
@@ -534,16 +718,26 @@ func startStaleDaemon(t *testing.T, cfg *config.Config, root string) *staleDaemo
 	if err != nil {
 		t.Fatal(err)
 	}
+	livenessPath, _, err := LockPaths(cfg, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireLiveness(context.Background(), livenessPath, 0)
+	if err != nil {
+		t.Fatalf("the stale daemon could not take the liveness lock: %v", err)
+	}
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
+		_ = lock.release()
 		t.Fatalf("binding the stale daemon socket: %v", err)
 	}
 
-	d := &staleDaemon{listener: listener, socket: socket, done: make(chan struct{})}
+	d := &staleDaemon{listener: listener, socket: socket, lock: lock, teardown: teardown, done: make(chan struct{})}
 	go d.serve()
 	t.Cleanup(func() {
 		_ = listener.Close()
 		<-d.done
+		d.release()
 	})
 	return d
 }
@@ -579,11 +773,20 @@ func (d *staleDaemon) handle(conn net.Conn) {
 			d.sawDrain.Store(true)
 			resp, _ := protocol.NewResponse(req.ID, protocol.DrainResult{Draining: true})
 			_ = codec.WriteResponse(resp)
-			// A real daemon finishes its in-flight work first; this one has
-			// none, so it stops accepting immediately and unlinks its socket,
-			// which is what lets the fresh daemon bind.
+			// The ack means "I have STARTED standing down", and the real
+			// daemon's teardown ordering (docs §6.5) runs afterwards: stop
+			// accepting, drain, cancel, close connections, then the language
+			// servers. Its liveness lock — not its socket file — is what says
+			// "a daemon is running here", and it drops only at the very end.
+			//
+			// The socket is deliberately NOT unlinked here. A stale socket file
+			// never blocked anything: listenUnix removes one before binding,
+			// which it is safe to do precisely because the LOCK is held.
 			_ = d.listener.Close()
-			_ = os.Remove(d.socket)
+			go func() {
+				time.Sleep(d.teardown)
+				d.release()
+			}()
 			return
 		default:
 			_ = codec.WriteResponse(protocol.NewErrorResponse(req.ID,
@@ -932,6 +1135,272 @@ func TestRequestsWithoutASessionAreRefused(t *testing.T) {
 }
 
 // ---- goroutine hygiene -----------------------------------------------------
+
+// ---- drain is not a kill ---------------------------------------------------
+
+// TestDrainGraceDefaultsWhenTheCallerLeavesItUnset pins the shape cmd/langer
+// actually builds.
+//
+// applyDefaults guarded DrainGrace with `< 0` where every sibling bound uses
+// `<= 0`, so the zero value survived — and cmd/langer's runDaemon sets only
+// Root, Config and Logger. The shipped daemon therefore ran with a grace of
+// exactly zero, which makes docs §6.5 step 2 ("cancel in-flight request
+// contexts AFTER a grace window") and SPEC §3.1's "asks the old daemon to
+// drain" both untrue: drain was an abort. DefaultDrainGrace was unreachable.
+func TestDrainGraceDefaultsWhenTheCallerLeavesItUnset(t *testing.T) {
+	opts := Options{Root: fixtureRoot(t), Config: testConfig(t), Logger: testLogger(t)}
+	if err := opts.applyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if opts.DrainGrace != DefaultDrainGrace {
+		t.Errorf("DrainGrace = %v with the field unset, want DefaultDrainGrace (%v); "+
+			"cmd/langer builds Options exactly this way", opts.DrainGrace, DefaultDrainGrace)
+	}
+}
+
+// TestAnUnconfiguredDaemonLetsInFlightWorkFinish is the behavioural half: with
+// the Options cmd/langer builds, a request already running when a drain arrives
+// must still get its answer.
+func TestAnUnconfiguredDaemonLetsInFlightWorkFinish(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	h := startDaemon(t, func(o *Options) {
+		o.DrainGrace = 0 // exactly what cmd/langer leaves behind
+	}, func(_ string, _ int, s *fakeSession) {
+		s.hold = hold
+		s.entered = entered
+		s.symbols = `[{"name":"User","kind":11,"range":{"start":{"line":0,"character":0},` +
+			`"end":{"line":2,"character":1}},"selectionRange":{"start":{"line":0,"character":17},` +
+			`"end":{"line":0,"character":21}}}]`
+	})
+
+	client, ws := h.session("alice")
+
+	result := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := client.DocumentSymbols(ctx, protocol.DocumentParams{
+			Session: "alice", Workspace: ws, Path: "src/user.ts",
+		})
+		result <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		close(hold)
+		t.Fatal("the fake language server never received the query")
+	}
+
+	// Ask it to drain while that query is still running.
+	drainOverTheWire(t, h)
+
+	// The language server answers a moment later — well inside a 5 s grace, and
+	// far outside a zero one.
+	time.Sleep(300 * time.Millisecond)
+	close(hold)
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Errorf("a request in flight when the drain arrived failed with %v; "+
+				"SPEC §3.1 says the old daemon DRAINS, so it must finish its work", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+}
+
+// TestShutdownAnswersInFlightRequestsInsteadOfHangingUp: a request that
+// outlives the grace window must come back as the daemon's OWN structured
+// answer, not as a hang-up.
+//
+// Shutdown used to do `s.cancelReq(); s.closeConns()` back to back. A cancelled
+// handler turns the cancellation into a SPEC §3.6 error and writes it — but by
+// then the socket was already closed, so that answer went nowhere and the
+// caller saw only EOF. daemonctl renders EOF as NOT_READY too, so the code
+// survives, but the daemon's account of what happened does not: "the request I
+// was running was cancelled because I am standing down" and "your socket broke"
+// become indistinguishable at the one moment they differ.
+func TestShutdownAnswersInFlightRequestsInsteadOfHangingUp(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	defer close(hold)
+
+	h := startDaemon(t, func(o *Options) {
+		o.DrainGrace = 100 * time.Millisecond // expires while the query is still held
+	}, func(_ string, _ int, s *fakeSession) {
+		s.hold = hold
+		s.entered = entered
+	})
+
+	client, ws := h.session("alice")
+
+	result := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := client.DocumentSymbols(ctx, protocol.DocumentParams{
+			Session: "alice", Workspace: ws, Path: "src/user.ts",
+		})
+		result <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the fake language server never received the query")
+	}
+
+	drainOverTheWire(t, h)
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("a request cancelled by shutdown reported success")
+		}
+		got := protocol.AsError(err)
+		if got.Code != protocol.ErrNotReady {
+			t.Errorf("a request interrupted by shutdown gave %s, want %s", got.Code, protocol.ErrNotReady)
+		}
+		if strings.Contains(got.Message, "connection closed") {
+			t.Errorf("the caller got the client-side hang-up rendering (%q); "+
+				"the daemon threw away its own structured answer by closing the socket "+
+				"in the same breath as the cancellation", got.Message)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+}
+
+// drainOverTheWire asks the daemon to stand down and waits for the ack.
+func drainOverTheWire(t *testing.T, h *harness) {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", h.srv.SocketPath(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	codec := protocol.NewCodec(conn)
+	if err := codec.WriteRequest(protocol.NewRequest(1, protocol.MethodDrain,
+		mustJSON(t, protocol.DrainParams{Session: "alice", Reason: "test"}))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codec.ReadResponse(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAConnectionAcceptedAfterShutdownBeganIsRefused is the deterministic half
+// of the regression below: once the daemon has closed the connections it knew
+// about, the registry must REFUSE later arrivals rather than silently accept
+// them into a set nobody will ever read again.
+func TestAConnectionAcceptedAfterShutdownBeganIsRefused(t *testing.T) {
+	fake := newFakeLSP(t, nil)
+	srv, err := NewServer(Options{
+		Root: fixtureRoot(t), Config: testConfig(t), Logger: testLogger(t),
+		IdleTimeout: time.Hour, Resolver: fake, Runner: fake,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The daemon is now past docs §6.5 step 3.
+	srv.closeConns()
+
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	if srv.trackConn(left) {
+		t.Fatal("a connection accepted during shutdown was tracked; nothing will ever close it")
+	}
+}
+
+// TestRunReturnsWhenClientsConnectDuringShutdown is the regression for a hang
+// that denies a whole workspace its daemon.
+//
+// closeConns snapshotted s.conns once. A connection accepted between that
+// snapshot and its serve goroutine reaching trackConn was therefore never
+// closed, so that goroutine parked in ReadRequest for ever and Run never
+// returned from wg.Wait. Run's deferred lock.release never ran either, so the
+// zombie held the liveness flock while its socket was already unlinked: every
+// later Connect dialled nothing, spawned one child that died on the lock, and
+// returned NOT_READY for ever.
+//
+// TestShutdownJoinsEveryGoroutine cannot reach this window — it closes its
+// client BEFORE cancelling — so the property needs its own test.
+func TestRunReturnsWhenClientsConnectDuringShutdown(t *testing.T) {
+	for round := 0; round < 30; round++ {
+		func() {
+			fake := newFakeLSP(t, nil)
+			srv, err := NewServer(Options{
+				Root: fixtureRoot(t), Config: testConfig(t), Logger: testLogger(t),
+				IdleTimeout: time.Hour,
+				// A short grace narrows the gap between "stop accepting" and
+				// "close what we accepted", which is exactly the gap a late
+				// arrival lands in. Production ran with zero (see
+				// TestDrainGraceDefaultsWhenTheCallerLeavesItUnset).
+				DrainGrace: time.Millisecond,
+				Resolver:   fake, Runner: fake,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			exit := make(chan error, 1)
+			go func() { exit <- srv.Run(ctx) }()
+			<-srv.Ready()
+
+			// Dial in a tight loop and HOLD every connection open, the way a
+			// client blocked on a handshake would.
+			socket := srv.SocketPath()
+			stop := make(chan struct{})
+			var dialers sync.WaitGroup
+			var mu sync.Mutex
+			var held []net.Conn
+			for i := 0; i < 16; i++ {
+				dialers.Add(1)
+				go func() {
+					defer dialers.Done()
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						conn, err := net.Dial("unix", socket)
+						if err != nil {
+							continue
+						}
+						mu.Lock()
+						held = append(held, conn)
+						mu.Unlock()
+					}
+				}()
+			}
+
+			time.Sleep(15 * time.Millisecond)
+			cancel()
+
+			select {
+			case <-exit:
+			case <-time.After(15 * time.Second):
+				t.Fatalf("round %d: Run never returned; it is parked in wg.Wait "+
+					"on a connection accepted during shutdown, still holding the liveness lock", round)
+			}
+
+			close(stop)
+			dialers.Wait()
+			mu.Lock()
+			for _, c := range held {
+				_ = c.Close()
+			}
+			mu.Unlock()
+		}()
+	}
+}
 
 // TestShutdownJoinsEveryGoroutine makes "Run does not return until every
 // goroutine it started has exited" a contract rather than a comment.

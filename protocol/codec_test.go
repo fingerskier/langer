@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // pipe is an in-memory ReadWriteCloser pair standing in for a socket.
@@ -161,6 +163,139 @@ func TestCodecRejectsOversizeFrames(t *testing.T) {
 	}
 	if code := AsError(err).Code; code != ErrInternal {
 		t.Errorf("oversize frame gave %s, want %s", code, ErrInternal)
+	}
+}
+
+// TestCodecSkipsBlankKeepaliveLines pins the tolerance a peer may rely on: a
+// blank line between frames is not a message.
+func TestCodecSkipsBlankKeepaliveLines(t *testing.T) {
+	stream := "\n\r\n\n" + `{"version":1,"id":7,"method":"index_status"}` + "\n"
+	c := NewCodec(nopCloser{strings.NewReader(stream)})
+
+	req, err := c.ReadRequest()
+	if err != nil {
+		t.Fatalf("ReadRequest after blank lines: %v", err)
+	}
+	if req.ID != 7 || req.Method != "index_status" {
+		t.Errorf("read %+v, want the request that followed the blank lines", req)
+	}
+}
+
+// endlessNewlines is a peer that sends newlines, never sends a message, and
+// never hangs up.
+//
+// The "never hangs up" half is what makes it the real adversary. A FINITE flood
+// out of a strings.Reader cannot prove anything about this bug: the read ends in
+// io.EOF, AsError renders that as INTERNAL, and the assertion below passes
+// whether readFrame loops or recurses — 1,000 newlines satisfy it just as well
+// as 4,000,000. (4,000,000 also simply fits: at ~32 bytes of frame per blank
+// line, the 1 GiB goroutine stack does not overflow until ~33M of them.) A peer
+// under no obligation to stop is the case the daemon actually has to survive.
+type endlessNewlines struct{}
+
+func (endlessNewlines) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = '\n'
+	}
+	return len(p), nil
+}
+func (endlessNewlines) Write(p []byte) (int, error) { return len(p), nil }
+func (endlessNewlines) Close() error                { return nil }
+
+// TestCodecSurvivesANewlineFlood is the regression for a peer that sends
+// nothing but newlines.
+//
+// readFrame used to skip a blank line by CALLING ITSELF. Against a peer that
+// keeps sending, that recursion has no bottom: it exhausts the goroutine stack
+// and the runtime THROWS `fatal error: stack overflow`. A throw is not a panic —
+// recover cannot catch it, the per-connection goroutine cannot be isolated, and
+// the WHOLE daemon process dies, taking every other client's language servers
+// and warm state with it, because one peer wrote whitespace to a socket it can
+// already reach.
+//
+// Verified: with the recursive implementation restored, this test does not fail,
+// it CRASHES the test binary at codec.go readFrame → readFrame → …
+//
+// The requirement is therefore not merely "an error" — io.EOF would satisfy that
+// — but that the codec RETURNS, and returns a structured refusal that names the
+// reason, so the daemon logs a protocol error instead of dying.
+func TestCodecSurvivesANewlineFlood(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		c := NewCodec(endlessNewlines{})
+		_, err := c.ReadRequest()
+		done <- err
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("ReadRequest never returned on an endless newline stream; " +
+			"the blank-line skip is unbounded and the peer decides when it ends")
+	}
+
+	if err == nil {
+		t.Fatal("a newline flood produced a request")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatal("the flood ended in EOF; this peer never hangs up, so the codec " +
+			"itself must be what stops it")
+	}
+	got := AsError(err)
+	if got.Code != ErrInternal {
+		t.Errorf("a newline flood gave %s, want %s", got.Code, ErrInternal)
+	}
+	if !strings.Contains(got.Message, "blank") {
+		t.Errorf("the refusal %q does not say the peer sent blank frames; "+
+			"an operator cannot tell this from any other INTERNAL", got.Message)
+	}
+}
+
+// TestCodecWriteRefusalIsIdentifiable: a caller must be able to tell "this
+// result does not fit in a frame" from "this socket is broken", because the
+// first has an answer it can still send and the second does not.
+func TestCodecWriteRefusalIsIdentifiable(t *testing.T) {
+	var sink syncBuffer
+	c := NewCodec(nopCloser{&sink})
+
+	err := c.WriteResponse(&Response{ID: 1, Result: []byte(`"` + strings.Repeat("x", MaxFrameBytes) + `"`)})
+	if err == nil {
+		t.Fatal("WriteResponse accepted an oversize frame")
+	}
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Errorf("errors.Is(err, ErrFrameTooLarge) = false for %v", err)
+	}
+	if code := AsError(err).Code; code != ErrInternal {
+		t.Errorf("oversize write gave %s, want %s", code, ErrInternal)
+	}
+	if n := len(sink.String()); n != 0 {
+		t.Errorf("a refused frame put %d bytes on the wire", n)
+	}
+}
+
+// TestCodecWriteTimeoutBoundsAStalledPeer: a peer that stops reading must not
+// be able to park the writer for ever. Without a bound the socket buffer fills,
+// Write never returns, and whatever shared capacity that goroutine holds is
+// pinned for the lifetime of the process.
+func TestCodecWriteTimeoutBoundsAStalledPeer(t *testing.T) {
+	left, right := net.Pipe() // an unbuffered conn: nobody reads `right`
+	defer left.Close()
+	defer right.Close()
+
+	c := NewCodec(left)
+	c.SetWriteTimeout(100 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- c.WriteRequest(NewRequest(1, MethodIndexStatus, nil)) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a write to a peer that never reads succeeded")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("WriteRequest to a stalled peer never returned; the deadline is not applied")
 	}
 }
 

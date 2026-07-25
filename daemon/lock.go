@@ -1,12 +1,14 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"net"
 	"os"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/protocol"
@@ -33,18 +35,46 @@ func LockPaths(cfg *config.Config, root string) (liveness, spawn string, err err
 // LogPath is where an auto-started daemon writes its log.
 func LogPath(cfg *config.Config, root string) string { return cfg.WorkspaceLogPath(root) }
 
-// livenessLock is an exclusive, non-blocking flock held for a daemon's whole
-// lifetime. It — not the presence of a socket file — is what "a daemon is
-// running for this workspace" means. A killed daemon leaves its socket behind
-// but cannot leave its lock behind: the kernel drops the flock when the process
-// dies.
+// Bounds on waiting for the outgoing daemon's liveness lock.
+const (
+	// DefaultLivenessLockWait is how long a starting daemon waits for a
+	// PREDECESSOR to let go of the workspace's liveness lock.
+	//
+	// Waiting, rather than failing on the first EWOULDBLOCK, is what makes
+	// SPEC §3.1's drain-and-restart work at all. The client asks the old daemon
+	// to drain, gets its ack, and spawns the replacement immediately — but the
+	// ack only means "I have started standing down". The old process still has
+	// to finish in-flight work (DrainGrace), let the answers land (replyGrace),
+	// and tear down its language servers (shutdownGrace, up to 10 s of
+	// `shutdown` request plus process exit on a busy tsserver) before its lock
+	// drops. A replacement that gives up in that window dies, and — since
+	// daemonctl spawns exactly once — the workspace is left with NO daemon at
+	// all until an agent happens to retry. This bound comfortably covers that
+	// teardown, which is itself bounded by the constants in server.go.
+	DefaultLivenessLockWait = 25 * time.Second
+	// livenessLockPoll is the interval between attempts. A blocking flock
+	// cannot be interrupted by a context, and a shutdown that cannot be
+	// interrupted is how a daemon becomes unkillable, so this polls instead.
+	livenessLockPoll = 25 * time.Millisecond
+)
+
+// livenessLock is an exclusive flock held for a daemon's whole lifetime. It —
+// not the presence of a socket file — is what "a daemon is running for this
+// workspace" means. A killed daemon leaves its socket behind but cannot leave
+// its lock behind: the kernel drops the flock when the process dies.
 type livenessLock struct {
 	path string
 	file *os.File
 }
 
-// acquireLiveness takes the lock, or reports that somebody else holds it.
-func acquireLiveness(path string) (*livenessLock, error) {
+// acquireLiveness takes the lock, waiting up to wait for a predecessor to
+// release it.
+//
+// Contention is reported as NOT_READY with a retry hint, never INTERNAL:
+// SPEC §3.6 defines INTERNAL as "bug in the bridge", and "the daemon I am
+// replacing has not finished standing down yet" is neither a bug nor
+// permanent. A wait of zero or less means a single attempt.
+func acquireLiveness(ctx context.Context, path string, wait time.Duration) (*livenessLock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, protocol.NewErrorf(protocol.ErrInternal, "opening lock %s: %v", path, err)
@@ -56,13 +86,9 @@ func acquireLiveness(path string) (*livenessLock, error) {
 		return nil, protocol.NewErrorf(protocol.ErrInternal, "securing lock %s: %v", path, err)
 	}
 
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flockWait(ctx, file, wait); err != nil {
 		_ = file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, protocol.NewErrorf(protocol.ErrInternal,
-				"another langer daemon is already running for this workspace (lock %s)", path)
-		}
-		return nil, protocol.NewErrorf(protocol.ErrInternal, "locking %s: %v", path, err)
+		return nil, err
 	}
 
 	// The pid is for humans reading the directory; nothing depends on it, which
@@ -71,6 +97,35 @@ func acquireLiveness(path string) (*livenessLock, error) {
 		_, _ = file.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
 	}
 	return &livenessLock{path: path, file: file}, nil
+}
+
+// flockWait polls for an exclusive, non-blocking flock until it wins, the
+// context is done, or the deadline passes.
+func flockWait(ctx context.Context, file *os.File, wait time.Duration) error {
+	path := file.Name()
+	deadline := time.Now().Add(wait)
+	for {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return protocol.NewErrorf(protocol.ErrInternal, "locking %s: %v", path, err)
+		}
+		// Checked AFTER the attempt above, so a wait of zero still means one
+		// honest try rather than none.
+		if !time.Now().Before(deadline) {
+			return protocol.NewErrorf(protocol.ErrNotReady,
+				"another langer daemon still holds this workspace's lock after %s (lock %s)", wait, path).
+				WithRetryAfterMS(500)
+		}
+		select {
+		case <-ctx.Done():
+			return protocol.NewErrorf(protocol.ErrNotReady,
+				"gave up waiting for this workspace's daemon lock: %v", ctx.Err()).WithRetryAfterMS(500)
+		case <-time.After(livenessLockPoll):
+		}
+	}
 }
 
 // release drops the lock.

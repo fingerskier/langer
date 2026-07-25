@@ -1731,11 +1731,14 @@ internal/deps/                       (DELETE the package)
 
 ```
 internal/workspace/overlay.go        internal/workspace/overlay_test.go
-internal/workspace/edittoken.go      internal/workspace/edittoken_test.go
-internal/workspace/edit.go           internal/workspace/edit_test.go
 mcp/tools_edit.go                    mcp/tools_edit_test.go
 daemon/session.go                    (EndSession → overlay drop ONLY)
 ```
+
+`internal/workspace/edittoken.go` and `internal/workspace/edit.go` were struck
+from this list by **§10.13**: edit-token mint/verify and edit application are
+M2's, and live in M2's `internal/workspace/query.go`. M5 keeps overlays and the
+MCP tool surface.
 
 ### M6
 
@@ -1910,6 +1913,33 @@ the SPEC §3.5 method surface, it sits at layer 0 so it creates no cycles, and i
 lets the whole M4 tool surface be tested in-process against `daemon.Core` with
 no socket — which was the point of A's `ipc/` package, achieved without the
 package.
+
+**10.13 Which milestone owns `apply_edit`?**
+**[AMENDED after M2 — see §12; raised by the M2 adversarial review.]**
+§8 lists `internal/workspace/edittoken.go` and `internal/workspace/edit.go`
+under **M5**, and PLAN M5 names "`apply_edit` verifying hashes, rejecting
+`STALE_EDIT`" as a deliverable — but §4.2 puts `ApplyEdit` in **M2's**
+`protocol.Service`, §5.7 declares `Workspace.ApplyEdit` in the package surface
+*above* the "M5 internals" divider, and PLAN M2's own gate requires that "every
+§3.6 error code is exercised by a test", which for `STALE_EDIT` means an apply
+path. The contract asked for the method in M2 and the behaviour in M5.
+**Winner: M2 owns edit-token mint/verify and edit application**, implemented in
+the M2-owned `internal/workspace/query.go`; **M5 keeps overlays**
+(`internal/workspace/overlay.go`) and the MCP surface (`mcp/tools_edit.go`).
+No M5-owned file was created early: §8's rule ("may create or modify only the
+files listed for their milestone") was not broken, only its *intent* about
+sequencing.
+Consequence: `internal/workspace/edittoken.go` and `internal/workspace/edit.go`
+are struck from §8's M5 list, and the two M5 acceptance criteria that gate this
+code — "rename round-trip on fixtures" and "apply after out-of-band file change
+returns `STALE_EDIT`" — are **pulled forward into M2's gate**, where they are
+met by `TestRenameMintsATokenOverTheAffectedFiles`,
+`TestApplyEditWritesTheDryRunPlan`,
+`TestApplyEditAfterAnOutOfBandChangeIsStaleEdit`,
+`TestApplyEditWithAnUnknownTokenIsStaleEdit` and the socket-level `STALE_EDIT`
+case in `daemon/server_test.go`. M5's remaining criteria (overlay
+isolation between two sessions, overlay diagnostics with nothing written to
+disk) stay with M5.
 
 ---
 

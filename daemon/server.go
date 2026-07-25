@@ -36,6 +36,19 @@ const (
 	DefaultDrainGrace = 5 * time.Second
 	// shutdownGrace bounds the language server teardown.
 	shutdownGrace = 10 * time.Second
+	// replyGrace is how long, after request contexts are cancelled, handlers get
+	// to put their structured answer on the wire before the sockets are closed
+	// underneath them. A cancelled handler returns almost at once, so this costs
+	// microseconds in practice; what it buys is that a caller interrupted by a
+	// shutdown reads the daemon's own SPEC §3.6 error rather than an
+	// unexplained hang-up.
+	replyGrace = 2 * time.Second
+	// DefaultWriteTimeout bounds one response write. Nothing on the far side of
+	// a local socket can legitimately take this long to accept a frame, so it
+	// only fires for a peer that has stopped participating — and a peer must
+	// never be able to hold a MaxInFlight slot, or the sunset's in-flight count,
+	// by simply refusing to read.
+	DefaultWriteTimeout = 10 * time.Second
 	// backpressureRetryMS is the hint attached to a NOT_READY produced by the
 	// in-flight limit.
 	backpressureRetryMS = 100
@@ -54,6 +67,10 @@ type Options struct {
 	MaxInFlight    int
 	RequestTimeout time.Duration
 	DrainGrace     time.Duration
+	// WriteTimeout bounds one response write. A peer that has stopped reading
+	// must not be able to park a daemon goroutine — and the shared capacity it
+	// holds — for ever.
+	WriteTimeout time.Duration
 
 	// Resolver and Runner are the SPEC §9 process boundary, injectable so the
 	// daemon's crash handling can be driven without a real language server.
@@ -86,8 +103,17 @@ func (o *Options) applyDefaults() error {
 	if o.RequestTimeout <= 0 {
 		o.RequestTimeout = DefaultRequestTimeout
 	}
-	if o.DrainGrace < 0 {
+	// `<= 0`, like every bound above it. A zero here is a field the caller never
+	// set — cmd/langer's runDaemon sets only Root, Config and Logger — and
+	// treating that as "abort every in-flight request the instant a drain
+	// arrives" turns SPEC §3.1's drain into a kill. A caller that genuinely
+	// wants no grace says so with a distinct explicit value, not by leaving the
+	// field alone.
+	if o.DrainGrace <= 0 {
 		o.DrainGrace = DefaultDrainGrace
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = DefaultWriteTimeout
 	}
 	return nil
 }
@@ -105,6 +131,12 @@ type Server struct {
 	sem   chan struct{}
 	wg    sync.WaitGroup
 
+	// answering counts handlers that have not yet finished writing their
+	// response, so shutdown can let those answers land before the sockets go.
+	// It covers handshake and drain too, which return before beginRequest and
+	// are therefore invisible to the sunset's own in-flight count.
+	answering *quietGate
+
 	// reqCtx is the parent of every request context. It is NOT derived from the
 	// caller's context: shutdown gives in-flight work a grace window and only
 	// then cancels this, which a context inherited from a SIGINT could not do.
@@ -113,6 +145,67 @@ type Server struct {
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
+	// closing is set by closeConns, under mu, BEFORE it snapshots conns. A
+	// connection accepted after that point can never appear in the snapshot, so
+	// without this flag nothing would ever close it: its serve goroutine parked
+	// in ReadRequest for ever and Run never returned from wg.Wait — holding the
+	// liveness flock, with its socket already unlinked, which denies the whole
+	// workspace a daemon until the zombie is killed by hand.
+	closing bool
+}
+
+// quietGate counts work in progress and lets a waiter block, with a bound,
+// until it reaches zero.
+//
+// A closed-and-replaced channel is used rather than a sync.Cond because only a
+// channel composes with a timeout, and a shutdown backstop that cannot time out
+// is not a backstop.
+type quietGate struct {
+	mu    sync.Mutex
+	n     int
+	quiet chan struct{}
+}
+
+func newQuietGate() *quietGate { return &quietGate{quiet: make(chan struct{})} }
+
+func (g *quietGate) enter() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.n++
+}
+
+func (g *quietGate) leave() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.n > 0 {
+		g.n--
+	}
+	if g.n == 0 {
+		close(g.quiet)
+		g.quiet = make(chan struct{})
+	}
+}
+
+// waitQuiet blocks until nothing is in progress, or grace elapses.
+//
+// The timer is real time on purpose, exactly as sunset.waitQuiet's is: this is
+// a shutdown backstop, and a fake clock no test remembered to advance must not
+// be able to wedge it. Nothing spec'd is being measured.
+func (g *quietGate) waitQuiet(grace time.Duration) {
+	g.mu.Lock()
+	if g.n == 0 {
+		g.mu.Unlock()
+		return
+	}
+	quiet := g.quiet
+	g.mu.Unlock()
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-quiet:
+	case <-timer.C:
+	}
 }
 
 // NewServer prepares a daemon. It binds nothing and starts nothing: Run does
@@ -154,6 +247,7 @@ func NewServer(opts Options) (*Server, error) {
 		socket:    socket,
 		ready:     make(chan struct{}),
 		sem:       make(chan struct{}, opts.MaxInFlight),
+		answering: newQuietGate(),
 		reqCtx:    reqCtx,
 		cancelReq: cancelReq,
 		conns:     map[net.Conn]struct{}{},
@@ -182,7 +276,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	lock, err := acquireLiveness(livenessPath)
+	// A daemon spawned to REPLACE a draining one arrives while its predecessor
+	// still holds this lock: the drain ack means "standing down", not "gone".
+	// Waiting is what makes SPEC §3.1's drain-and-restart converge on a live
+	// daemon instead of leaving the workspace with none.
+	lock, err := acquireLiveness(ctx, livenessPath, DefaultLivenessLockWait)
 	if err != nil {
 		return err
 	}
@@ -215,6 +313,13 @@ func (s *Server) Run(ctx context.Context) error {
 	// 2. Give in-flight requests a grace window, then cancel them.
 	s.sun.waitQuiet(s.opts.DrainGrace)
 	s.cancelReq()
+	// A cancelled handler still has an answer to give: it turns the
+	// cancellation into a SPEC §3.6 error and writes it. Closing the sockets in
+	// the same breath as the cancellation threw that answer away and left the
+	// caller reading EOF, unable to tell a daemon standing down from a broken
+	// one. Cancelled handlers return almost immediately, so this waits
+	// microseconds in practice.
+	s.answering.waitQuiet(replyGrace)
 	// 3. Close client connections, which unblocks their readers.
 	s.closeConns()
 	// Join the acceptor and every connection goroutine before touching the
@@ -253,10 +358,21 @@ func (s *Server) accept(listener net.Listener) {
 	}
 }
 
-func (s *Server) trackConn(conn net.Conn) {
+// trackConn registers a connection for shutdown, reporting false once the
+// daemon is closing.
+//
+// Closing the listener does not cover this: the connection has ALREADY been
+// accepted, and the goroutine serving it would park in ReadRequest for ever
+// waiting on a peer that is under no obligation to say anything. The registry
+// has to know it is shut, not merely be read once.
+func (s *Server) trackConn(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
 	s.conns[conn] = struct{}{}
+	return true
 }
 
 func (s *Server) untrackConn(conn net.Conn) {
@@ -267,6 +383,7 @@ func (s *Server) untrackConn(conn net.Conn) {
 
 func (s *Server) closeConns() {
 	s.mu.Lock()
+	s.closing = true
 	all := make([]net.Conn, 0, len(s.conns))
 	for conn := range s.conns {
 		all = append(all, conn)
@@ -283,10 +400,18 @@ func (s *Server) serve(conn net.Conn) {
 	defer s.wg.Done()
 	defer func() { _ = conn.Close() }()
 
-	s.trackConn(conn)
+	if !s.trackConn(conn) {
+		// Accepted inside the shutdown window: hang up now, via the deferred
+		// Close, rather than reading from a peer nobody will ever answer.
+		return
+	}
 	defer s.untrackConn(conn)
 
 	codec := protocol.NewCodec(conn)
+	// A peer that stops reading must not be able to park a handler goroutine —
+	// and with it a MaxInFlight slot and the sunset's in-flight count — for the
+	// life of the process.
+	codec.SetWriteTimeout(s.opts.WriteTimeout)
 	sessions := newSessionSet()
 
 	admitted := s.sun.addClient()
@@ -317,9 +442,12 @@ func (s *Server) serve(conn net.Conn) {
 		if !admitted {
 			// Draining: refuse politely and structurally, so the client starts a
 			// fresh daemon instead of surfacing a transport error to the agent.
+			// Inside the gate, so shutdown lets the refusal land.
+			s.answering.enter()
 			s.reply(codec, protocol.NewErrorResponse(req.ID,
 				protocol.NewError(protocol.ErrNotReady, "daemon is draining; start a new one").
 					WithRetryAfterMS(50)))
+			s.answering.leave()
 			continue
 		}
 
@@ -331,14 +459,59 @@ func (s *Server) serve(conn net.Conn) {
 	}
 }
 
+// reply writes one response, and never lets a failure to write become silence.
+//
+// Two failures are handled differently because they mean opposite things:
+//
+//   - The result does not FIT in a frame. The daemon knows exactly what went
+//     wrong, and the peer is fine. Swallowing this into a log line meant no
+//     response was ever written for that id: the caller waited out its own
+//     deadline and was then told NOT_READY — "retry" — for a failure that is
+//     perfectly deterministic and will happen identically every time. Answer
+//     with the reason instead.
+//   - The SOCKET failed (including a write deadline expiring on a peer that
+//     stopped reading). Nothing more can be said on this connection, and a
+//     partial frame may already be on it, so hang up. That also unblocks this
+//     connection's reader.
 func (s *Server) reply(codec *protocol.Codec, resp *protocol.Response) {
-	if err := codec.WriteResponse(resp); err != nil {
-		s.log.Debug("writing a response failed", "error", err)
+	err := codec.WriteResponse(resp)
+	if err == nil {
+		return
 	}
+
+	if errors.Is(err, protocol.ErrFrameTooLarge) && resp.Error == nil {
+		// A deterministic refusal, not a transport failure: nothing was put on
+		// the wire, and re-sending the same query would fail identically. Say
+		// so, in the caller's own request id, instead of leaving it to wait out
+		// its deadline and be told to retry.
+		s.log.Warn("a result did not fit in one IPC frame", "id", resp.ID, "limit", protocol.MaxFrameBytes)
+		refusal := protocol.NewErrorResponse(resp.ID, protocol.NewErrorf(protocol.ErrInternal,
+			"the result does not fit in the %d byte IPC frame limit", protocol.MaxFrameBytes))
+		if err := codec.WriteResponse(refusal); err != nil {
+			s.log.Debug("writing the frame-limit refusal failed", "error", err)
+			_ = codec.Close()
+		}
+		return
+	}
+
+	// The socket failed — a broken peer, or a write deadline that expired
+	// because it stopped reading. A partial frame may already be on the wire,
+	// so nothing further can be said here. Hanging up is both the honest answer
+	// and what unblocks this connection's reader.
+	s.log.Debug("writing a response failed; closing the connection", "error", err)
+	_ = codec.Close()
 }
 
 // handle answers one request.
+//
+// The whole call is inside the answering gate, so shutdown can wait for the
+// response to reach the wire. handshake and drain need that as much as the
+// query methods do: they return before beginRequest, so the sunset's own
+// in-flight count never covered them.
 func (s *Server) handle(codec *protocol.Codec, sessions *sessionSet, req *protocol.Request) {
+	s.answering.enter()
+	defer s.answering.leave()
+
 	// handshake and drain are answered regardless of protocol version. That is
 	// the whole point of them: a client that has just discovered a version
 	// mismatch must still be able to ask the old daemon to stand down

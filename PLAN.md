@@ -29,6 +29,48 @@
 
 ---
 
+## Status (2026-07-25)
+
+| Milestone | State | Commit |
+|-----------|-------|--------|
+| M0 — scaffold, CLI, config, fixtures | **done** | `2d07acb` |
+| M1 — LSP client wrapper | **done** | `a400e7c` |
+| M2 — daemon process | **done**, reviewed + fixed | `da65ee8` + fixes |
+| M3 — SQLite index | not started | |
+| M4 — MCP frontend | not started | |
+| M5 — edits & speculative overlays | not started | |
+| M6 — security test, GC, v0.1 sign-off | not started | |
+
+Verification gates all green at this point: `gofmt`, `go build`, `go vet`
+(plain and `-tags=integration`), `go test ./...`, `go test ./... -race`, and
+`go test -tags=integration ./...` driving the real typescript-language-server
+5.3.0 and pyright 1.1.411.
+
+M0–M2 were each adversarially reviewed after implementation. That found real
+defects the passing test suite did not, and the pattern is worth keeping: in
+every milestone so far the serious bugs were **answers that were wrong in a way
+an agent could not detect**, not crashes. Examples: `workspace/symbol`
+returning an empty list while the server was still indexing (indistinguishable
+from "no such symbol"); a references query racing project load and returning
+only the declaration; speculative diagnostics surviving a `simulate_edit` and
+being reported against a clean file.
+
+### Carried into later milestones
+
+Known and deliberately deferred rather than forgotten:
+
+- **`apply_edit` lives in `internal/workspace/` already** (M2 shipped it). SPEC
+  §3.5 does not list it among daemon methods and it belongs to M5. Fold it into
+  M5 rather than writing a second implementation.
+- **`internal/testutil.NoGoroutineLeaks` compares goroutine *counts***, so a
+  real leak is masked whenever an unrelated goroutine exits concurrently. Every
+  "no goroutine leaks" assertion in M1 and M2 is weaker than it reads. Fix
+  before M6 signs off on process hygiene.
+- **SPEC §3.1's "configurable idle period" is not configurable** — no config
+  key, and `cmd/langer` never sets one. Needs a `config` key.
+
+---
+
 ## Milestones
 
 ### M0 — Scaffold, CLI, config, fixtures
