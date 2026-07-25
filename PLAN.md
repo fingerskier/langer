@@ -68,6 +68,13 @@ Known and deliberately deferred rather than forgotten:
   before M6 signs off on process hygiene.
 - **SPEC §3.1's "configurable idle period" is not configurable** — no config
   key, and `cmd/langer` never sets one. Needs a `config` key.
+- **Windows does not build.** `internal/procx/run.go` uses `Setsid`,
+  `Setpgid`, and `syscall.Kill` with no `_unix.go`/`_windows.go` split, and
+  the daemon transport is Unix-socket-only (SPEC's architecture diagram says
+  "Unix socket / named pipe"). All M0–M2 verification ran on Linux. Shipping
+  to claude-cli users includes Windows; either add a Windows port milestone
+  (build-tag procx, named-pipe or loopback-TCP transport, Windows CI) or
+  declare v0.1 Unix-only in SPEC §11 and README. Decide before M6 sign-off.
 
 ---
 
