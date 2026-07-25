@@ -1,0 +1,34 @@
+# Build output
+/langer
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+
+# Go tooling
+/vendor/
+coverage.txt
+coverage.html
+
+# Local runtime state (DB / socket / logs) if pointed at the repo
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local, non-committed developer overrides
+/.env
+/.langer/
+
+# NOTE: node_modules is deliberately NOT ignored. testdata/ts-project ships a
+# committed node_modules/.bin tripwire for the SPEC §9 security test (M6):
+# opening a workspace must never execute a project-local language server.
+# Ignoring it would silently delete the fixture that proves the invariant.
