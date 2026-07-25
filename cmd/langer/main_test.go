@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/protocol"
 )
 
 // isolate points HOME at a scratch dir and clears the langer env overrides so
@@ -242,13 +248,15 @@ func TestStatusReportsBadConfig(t *testing.T) {
 	}
 }
 
-// TestStubbedCommandsFailLoudly: M0 ships mcp and daemon as stubs. They must
-// not pretend to succeed, or a client would hang waiting on a dead pipe.
+// TestStubbedCommandsFailLoudly: mcp is still a stub (M4). It must not pretend
+// to succeed, or a client would hang waiting on a dead pipe.
+//
+// `daemon <root>` was a stub too until M2; it now serves, so it has its own
+// tests below.
 func TestStubbedCommandsFailLoudly(t *testing.T) {
 	isolate(t)
-	root := t.TempDir()
 
-	for _, args := range [][]string{{"mcp", "--stdio"}, {"daemon", root}} {
+	for _, args := range [][]string{{"mcp", "--stdio"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if code := run(args, &stdout, &stderr); code != exitFailure {
@@ -258,5 +266,130 @@ func TestStubbedCommandsFailLoudly(t *testing.T) {
 				t.Errorf("stub did not say it is unimplemented:\n%s", stderr.String())
 			}
 		})
+	}
+}
+
+// TestDaemonSubcommandServesAndDrains is the CLI half of M2: `langer daemon
+// <root>` really listens, and it stops cleanly when asked to drain.
+func TestDaemonSubcommandServesAndDrains(t *testing.T) {
+	isolate(t)
+	cfg := useShortSocketDir(t)
+	root := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	exit := make(chan int, 1)
+	go func() { exit <- run([]string{"daemon", root}, &stdout, &stderr) }()
+
+	socket := waitForSocket(t, cfg, root)
+	drainDaemon(t, socket)
+
+	select {
+	case code := <-exit:
+		if code != exitOK {
+			t.Errorf("run(daemon) = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the daemon did not exit after being asked to drain")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("the daemon wrote to stdout:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the socket %s outlived the daemon (err=%v)", socket, err)
+	}
+}
+
+// TestDaemonSubcommandReportsStartupFailures: a daemon that cannot bind must
+// say so and exit non-zero, not linger.
+func TestDaemonSubcommandReportsStartupFailures(t *testing.T) {
+	isolate(t)
+	// /dev/null is not a directory, so the runtime directory cannot be created.
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("socket_path = \"/dev/null/langer/daemon.sock\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigPath, cfgPath)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"daemon", t.TempDir()}, &stdout, &stderr); code != exitFailure {
+		t.Fatalf("run(daemon) = %d, want %d", code, exitFailure)
+	}
+	if stderr.Len() == 0 {
+		t.Error("the daemon failed silently")
+	}
+}
+
+// useShortSocketDir points the config at a socket directory short enough for
+// sockaddr_un. macOS's per-user TMPDIR plus a test name routinely exceeds the
+// ~104 byte limit, and the daemon refuses rather than letting the kernel
+// truncate.
+func useShortSocketDir(t *testing.T) *config.Config {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "langer")
+	if err != nil {
+		t.Skipf("cannot create a short temporary directory under /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	body := "socket_path = " + strconv.Quote(filepath.Join(dir, "daemon.sock")) + "\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigPath, cfgPath)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func waitForSocket(t *testing.T, cfg *config.Config, root string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := cfg.WorkspaceSocketPath(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socket); err == nil {
+			return socket
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the daemon never bound %s", socket)
+	return ""
+}
+
+// drainDaemon speaks the wire protocol directly: SPEC §3.1's drain is a
+// lifecycle request, not a Service method, so there is no client API for it.
+func drainDaemon(t *testing.T, socket string) {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dialling %s: %v", socket, err)
+	}
+	defer conn.Close()
+
+	codec := protocol.NewCodec(conn)
+	params, err := json.Marshal(protocol.DrainParams{Session: "cli-test", Reason: "test over"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := codec.WriteRequest(protocol.NewRequest(1, protocol.MethodDrain, params)); err != nil {
+		t.Fatalf("writing drain: %v", err)
+	}
+	resp, err := codec.ReadResponse()
+	if err != nil {
+		t.Fatalf("reading the drain response: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("drain failed: %v", resp.Error)
 	}
 }

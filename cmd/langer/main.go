@@ -7,15 +7,21 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/daemon"
+	"github.com/fingerskier/langer/internal/daemonctl"
 )
 
 // Exit codes. Usage problems are distinguishable from runtime failures so a
@@ -207,9 +213,74 @@ func runMCP(_ *invocation, _, _ io.Writer) error {
 	return errors.New("MCP frontend not implemented yet (milestone M4)")
 }
 
-// runDaemon is the M2 entry point. Stubbed for M0.
-func runDaemon(_ *invocation, _, _ io.Writer) error {
-	return errors.New("daemon not implemented yet (milestone M2)")
+// runDaemon runs the workspace daemon until it is signalled or sunsets
+// (SPEC §3.1). It is normally auto-started by the MCP frontend; running it by
+// hand is the documented way to watch what it is doing.
+func runDaemon(inv *invocation, _, stderr io.Writer) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	logger, closeLog, err := daemonLogger(cfg, inv.Root, stderr)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
+	slog.SetDefault(logger)
+
+	// A daemon must stop cleanly on SIGINT and SIGTERM: shutdown ordering
+	// (docs/ARCHITECTURE.md §6.5) is what stops a language server process group
+	// leaking on every run.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	server, err := daemon.NewServer(daemon.Options{
+		Root:   inv.Root,
+		Config: cfg,
+		Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+	return server.Run(ctx)
+}
+
+// daemonLogger decides where the daemon's log goes.
+//
+// A daemon auto-started by a client inherits that client's stderr pipe. Once
+// the client exits, writing to it raises SIGPIPE — which kills the process the
+// moment it logs anything, and SPEC §8 requires the daemon to survive client
+// disconnects. So an auto-started daemon logs to a file instead; the client
+// names it in the environment. Run by hand, it logs to stderr as usual.
+func daemonLogger(cfg *config.Config, root string, stderr io.Writer) (*slog.Logger, func(), error) {
+	dst := stderr
+	closeLog := func() {}
+
+	if path := os.Getenv(daemonctl.EnvSpawned); path != "" {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return nil, nil, fmt.Errorf("opening the daemon log %s: %w", path, err)
+		}
+		dst = file
+		closeLog = func() { _ = file.Close() }
+	}
+
+	handler := slog.NewTextHandler(dst, &slog.HandlerOptions{Level: logLevel(cfg.LogLevel)})
+	return slog.New(handler).With("root", root), closeLog, nil
+}
+
+func logLevel(name string) slog.Level {
+	switch name {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // runStatus reports what M0 can actually know: the resolved configuration and

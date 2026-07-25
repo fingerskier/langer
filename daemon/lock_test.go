@@ -1,0 +1,144 @@
+package daemon
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/protocol"
+)
+
+// TestLivenessLockIsExclusive: the lock, not the presence of a socket file, is
+// what "a daemon is running for this workspace" means.
+func TestLivenessLockIsExclusive(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+
+	first, err := acquireLiveness(path)
+	if err != nil {
+		t.Fatalf("acquireLiveness: %v", err)
+	}
+
+	if _, err := acquireLiveness(path); err == nil {
+		t.Fatal("a second holder acquired the same liveness lock")
+	} else if code := protocol.AsError(err).Code; code != protocol.ErrInternal {
+		t.Errorf("a contended lock reported %s, want a structured error", code)
+	}
+
+	if err := first.release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// After release the lock is available again — a daemon that exits cleanly
+	// must not poison its workspace.
+	second, err := acquireLiveness(path)
+	if err != nil {
+		t.Fatalf("the lock was not released: %v", err)
+	}
+	if err := second.release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLivenessLockFileSurvivesRelease pins the deliberate decision not to
+// unlink: unlinking after unlocking lets a second waiter hold a lock on an
+// inode a third process can no longer see, and two daemons start.
+func TestLivenessLockFileSurvivesRelease(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+
+	lock, err := acquireLiveness(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the lock file was unlinked on release: %v", err)
+	}
+}
+
+// TestLivenessLockIsUserOnly, including when it was created loosely by an
+// older build (SPEC §9).
+func TestLivenessLockIsUserOnly(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "daemon.lock")
+	if err := os.WriteFile(path, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := acquireLiveness(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.release()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("lock mode = %o, want 600", perm)
+	}
+}
+
+// TestListenUnixReplacesAStaleSocketAndSecuresTheNewOne.
+func TestListenUnixReplacesAStaleSocketAndSecuresTheNewOne(t *testing.T) {
+	socket := filepath.Join(shortTempDir(t), "daemon.sock")
+	if err := os.WriteFile(socket, []byte("left behind by a killed daemon"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	listener, err := listenUnix(socket)
+	if err != nil {
+		t.Fatalf("listenUnix: %v", err)
+	}
+	defer listener.Close()
+
+	info, err := os.Stat(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("socket mode = %o, want 600 (SPEC §9)", perm)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Error("the stale regular file was not replaced by a socket")
+	}
+}
+
+// TestSocketPathIsRefusedWhenTooLong: sockaddr_un truncates silently, and two
+// deeply nested roots that truncate to the same name would share one daemon.
+func TestSocketPathIsRefusedWhenTooLong(t *testing.T) {
+	cfg := &config.Config{SocketPath: filepath.Join("/"+strings.Repeat("nested/", 20), "daemon.sock")}
+
+	_, err := SocketPath(cfg, "/repo")
+	if err == nil {
+		t.Fatal("an over-long socket path was accepted")
+	}
+	if code := protocol.AsError(err).Code; code != protocol.ErrInternal {
+		t.Errorf("code = %s, want %s", code, protocol.ErrInternal)
+	}
+}
+
+// TestLockPathsAreDistinct: one file cannot be handed from the spawning client
+// to the spawned daemon without a window in which neither holds it.
+func TestLockPathsAreDistinct(t *testing.T) {
+	cfg := testConfig(t)
+
+	liveness, spawn, err := LockPaths(cfg, "/repo/alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveness == spawn {
+		t.Fatalf("the liveness and spawn locks are the same file: %s", liveness)
+	}
+
+	otherLiveness, _, err := LockPaths(cfg, "/repo/beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveness == otherLiveness {
+		t.Errorf("two workspaces share the liveness lock %s", liveness)
+	}
+}
