@@ -1,0 +1,7 @@
+{
+  "name": "langer-ts-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal TypeScript fixture for langer integration tests. No real dependencies are installed; node_modules holds only the M6 security tripwire.",
+  "type": "commonjs"
+}

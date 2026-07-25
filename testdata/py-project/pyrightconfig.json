@@ -1,0 +1,8 @@
+{
+  "include": ["."],
+  "exclude": ["**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "reportMissingImports": "error",
+  "useLibraryCodeForTypes": true
+}
