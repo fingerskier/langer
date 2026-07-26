@@ -13,11 +13,10 @@
   ],
   "type": "module",
   "bin": {
-    "langer-install": "./bin/cli.js",
-    "langer-npm": "./bin/cli.js"
+    "langer-install": "bin/langer-install.js"
   },
   "files": [
-    "bin",
+    "bin/langer-install.js",
     "lib",
     "README.md",
     "LICENSE"
