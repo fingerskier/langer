@@ -81,9 +81,9 @@ func acquireLiveness(ctx context.Context, path string, wait time.Duration) (*liv
 	}
 	// A lock file left behind by an older, looser build must not stay readable
 	// by other users (SPEC §9).
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := RestrictUserOnlyFile(path); err != nil {
 		_ = file.Close()
-		return nil, protocol.NewErrorf(protocol.ErrInternal, "securing lock %s: %v", path, err)
+		return nil, err
 	}
 
 	if err := flockWait(ctx, file, wait); err != nil {
@@ -165,13 +165,13 @@ func listenUnix(socketPath string) (net.Listener, error) {
 	if err != nil {
 		return nil, protocol.NewErrorf(protocol.ErrInternal, "listening on %s: %v", socketPath, err)
 	}
-	// bind() honours the umask, so an explicit chmod is what makes 0600 true
+	// bind() honours the umask, so RestrictUserOnlyFile is what makes 0600 true
 	// (SPEC §9). The window before it is closed by the 0700 runtime directory:
 	// nobody else can traverse it to reach the socket at all.
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	if err := RestrictUserOnlyFile(socketPath); err != nil {
 		_ = listener.Close()
 		_ = os.Remove(socketPath)
-		return nil, protocol.NewErrorf(protocol.ErrInternal, "securing socket %s: %v", socketPath, err)
+		return nil, err
 	}
 	return listener, nil
 }

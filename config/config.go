@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -82,10 +83,29 @@ type LanguageServer struct {
 // Config is the fully resolved configuration: file values with environment
 // overrides applied and defaults filled in.
 type Config struct {
-	DatabasePath    string           `toml:"database_path"`
-	SocketPath      string           `toml:"socket_path"`
-	LogLevel        string           `toml:"log_level"`
+	DatabasePath string `toml:"database_path"`
+	SocketPath   string `toml:"socket_path"`
+	LogLevel     string `toml:"log_level"`
+	// IdleTimeout is the SPEC §3.1 daemon sunset period as a Go duration
+	// string (for example "30m"). Empty means the daemon default (30 minutes).
+	IdleTimeout     string           `toml:"idle_timeout"`
 	LanguageServers []LanguageServer `toml:"language_servers"`
+}
+
+// IdleDuration returns the configured idle sunset period, or 0 when unset so
+// the daemon can apply its own default.
+func (c *Config) IdleDuration() (time.Duration, error) {
+	if c == nil || strings.TrimSpace(c.IdleTimeout) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(c.IdleTimeout))
+	if err != nil {
+		return 0, fmt.Errorf("idle_timeout %q: %w", c.IdleTimeout, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("idle_timeout %q must be positive", c.IdleTimeout)
+	}
+	return d, nil
 }
 
 // configHome returns $XDG_CONFIG_HOME, or ~/.config when it is unset or empty.
@@ -261,6 +281,9 @@ func (c *Config) applyDefaults() error {
 func (c *Config) Validate() error {
 	if !validLogLevel(c.LogLevel) {
 		return fmt.Errorf("log_level %q is not one of %s", c.LogLevel, strings.Join(LogLevels, ", "))
+	}
+	if _, err := c.IdleDuration(); err != nil {
+		return err
 	}
 
 	seen := make(map[string]struct{}, len(c.LanguageServers))

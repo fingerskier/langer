@@ -608,16 +608,19 @@ detail line is pyright-version-sensitive.
 Files:
 
 ```
-ts-project/node_modules/.bin/fake-server                     (mode 0755)
-ts-project/node_modules/.bin/typescript-language-server       (mode 0755)
+ts-project/node_modules/.bin/fake-server                     (Unix sh, mode 0755)
+ts-project/node_modules/.bin/typescript-language-server       (Unix sh, mode 0755)
+ts-project/node_modules/.bin/fake-server.cmd                  (Windows tripwire)
+ts-project/node_modules/.bin/typescript-language-server.cmd   (Windows tripwire)
 ts-project/node_modules/fake-language-server/bin/fake-server.sh (mode 0755)
 ts-project/node_modules/fake-language-server/package.json
 ts-project/node_modules/.package-lock.json
 ```
 
-All three scripts are byte-identical `/bin/sh` scripts. They live inside
-`node_modules/` **on purpose** — that is the entire point of SPEC §9's
-invariant: *opening a workspace must never execute project-local binaries.*
+Unix tripwires are `/bin/sh` scripts; Windows tripwires are `.cmd` siblings so
+PATHEXT-aware lookup can see them. They live inside `node_modules/` **on
+purpose** — that is the entire point of SPEC §9's invariant: *opening a
+workspace must never execute project-local binaries.*
 
 ## 3.1 Contract
 

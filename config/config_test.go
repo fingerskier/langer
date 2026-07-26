@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -405,6 +406,38 @@ file_extensions = [".py"]
 	}
 	if cfg.LanguageServers[0].AllowWorkspaceLocal {
 		t.Fatal("allow_workspace_local defaulted to true; SPEC §9 requires opt-IN")
+	}
+}
+
+func TestIdleTimeoutParsesAndRejectsBadValues(t *testing.T) {
+	isolate(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("idle_timeout = \"45m\"\nlog_level = \"info\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	got, err := cfg.IdleDuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 45*time.Minute {
+		t.Fatalf("IdleDuration = %v, want 45m", got)
+	}
+
+	if err := os.WriteFile(path, []byte("idle_timeout = \"nope\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFrom(path); err == nil {
+		t.Fatal("invalid idle_timeout was accepted")
+	}
+	if err := os.WriteFile(path, []byte("idle_timeout = \"0s\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFrom(path); err == nil {
+		t.Fatal("non-positive idle_timeout was accepted")
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -920,25 +919,22 @@ func TestDrainRefusesNewWork(t *testing.T) {
 // TestSocketAndLocksAreUserOnly is SPEC §9's "database and socket files should
 // have restrictive permissions (user-only)".
 func TestSocketAndLocksAreUserOnly(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows endpoint ACL verification is an M6 gate")
-	}
 	h := startDaemon(t, nil, nil)
 
 	dir, err := os.Stat(h.cfg.RuntimeDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := dir.Mode().Perm(); perm != 0o700 {
-		t.Errorf("runtime directory mode = %o, want 700", perm)
+	if !DirIsUserOnly(dir) {
+		t.Errorf("runtime directory mode = %o, want user-only", dir.Mode().Perm())
 	}
 
 	socket, err := os.Stat(h.srv.SocketPath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := socket.Mode().Perm(); perm != 0o600 {
-		t.Errorf("socket mode = %o, want 600", perm)
+	if !FileIsUserOnly(socket) {
+		t.Errorf("socket mode = %o, want user-only", socket.Mode().Perm())
 	}
 
 	livenessPath, spawnPath, err := LockPaths(h.cfg, h.root)
@@ -949,14 +945,14 @@ func TestSocketAndLocksAreUserOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := liveness.Mode().Perm(); perm != 0o600 {
-		t.Errorf("liveness lock mode = %o, want 600", perm)
+	if !FileIsUserOnly(liveness) {
+		t.Errorf("liveness lock mode = %o, want user-only", liveness.Mode().Perm())
 	}
 	// The spawn lock is created by clients; make one and check it too.
 	h.connect("alice")
 	if info, err := os.Stat(spawnPath); err == nil {
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("spawn lock mode = %o, want 600", perm)
+		if !FileIsUserOnly(info) {
+			t.Errorf("spawn lock mode = %o, want user-only", info.Mode().Perm())
 		}
 	}
 }

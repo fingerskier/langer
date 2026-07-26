@@ -260,10 +260,15 @@ func runDaemon(inv *invocation, _, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	idle, err := cfg.IdleDuration()
+	if err != nil {
+		return err
+	}
 	server, err := daemon.NewServer(daemon.Options{
-		Root:   inv.Root,
-		Config: cfg,
-		Logger: logger,
+		Root:        inv.Root,
+		Config:      cfg,
+		Logger:      logger,
+		IdleTimeout: idle,
 	})
 	if err != nil {
 		return err
