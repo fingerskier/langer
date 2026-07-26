@@ -786,14 +786,42 @@ func TestRealDaemonSimulateEditNeverTouchesDisk(t *testing.T) {
 		t.Fatal("simulate_edit wrote to disk")
 	}
 
-	// And the real file still type-checks: the speculative text was restored.
-	clean, err := client.GetDiagnostics(ctx, protocol.DiagnosticsParams{
+	// Same session: overlay still shadows disk for get_diagnostics (SPEC §4.2).
+	overlayView, err := client.GetDiagnostics(ctx, protocol.DiagnosticsParams{
 		Session: "alice", Workspace: ws, Path: "src/user.ts",
 	})
 	if err != nil {
-		t.Fatalf("get_diagnostics after simulate_edit: %v", err)
+		t.Fatalf("get_diagnostics under overlay: %v", err)
+	}
+	if len(overlayView.Diagnostics) == 0 {
+		t.Errorf("same-session get_diagnostics lost the speculative errors (possibly_stale=%v)", overlayView.PossiblyStale)
+	}
+
+	// Other session: disk baseline, not alice's overlay.
+	bob, _ := h.session("bob")
+	clean, err := bob.GetDiagnostics(ctx, protocol.DiagnosticsParams{
+		Session: "bob", Workspace: ws, Path: "src/user.ts",
+	})
+	if err != nil {
+		t.Fatalf("get_diagnostics for other session: %v", err)
 	}
 	if len(clean.Diagnostics) != 0 {
-		t.Errorf("the speculative text was left in place: %+v", clean.Diagnostics)
+		t.Errorf("another session observed alice's overlay: %+v", clean.Diagnostics)
+	}
+
+	// After EndSession the overlay is gone and alice sees disk again.
+	if _, err := client.EndSession(ctx, protocol.EndSessionParams{Session: "alice"}); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	// Re-open a client session identity for the follow-up query.
+	alice2, _ := h.session("alice")
+	restored, err := alice2.GetDiagnostics(ctx, protocol.DiagnosticsParams{
+		Session: "alice", Workspace: ws, Path: "src/user.ts",
+	})
+	if err != nil {
+		t.Fatalf("get_diagnostics after EndSession: %v", err)
+	}
+	if len(restored.Diagnostics) != 0 {
+		t.Errorf("overlay survived EndSession: %+v", restored.Diagnostics)
 	}
 }

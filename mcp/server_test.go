@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"reflect"
 	"sort"
 	"testing"
@@ -12,7 +11,7 @@ import (
 	"github.com/fingerskier/langer/protocol"
 )
 
-func TestM4RegistersExactlyNineTools(t *testing.T) {
+func TestM5RegistersExactlyTwelveTools(t *testing.T) {
 	_, client, closeAll := connectedServer(t, &fakeService{})
 	defer closeAll()
 
@@ -24,9 +23,68 @@ func TestM4RegistersExactlyNineTools(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	sort.Strings(names)
-	want := []string{"close_document", "document_symbols", "get_definition", "get_diagnostics", "get_hover", "get_references", "index_status", "open_document", "workspace_symbols"}
+	want := []string{
+		"apply_edit", "close_document", "document_symbols", "get_definition",
+		"get_diagnostics", "get_hover", "get_references", "index_status",
+		"open_document", "rename_symbol", "simulate_edit", "workspace_symbols",
+	}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("tools = %v, want %v", names, want)
+	}
+}
+
+func TestEditToolsRelaySessionAndStructuredResults(t *testing.T) {
+	fake := &fakeService{
+		rename:   protocol.EditPlanResult{EditToken: "tok", Files: []protocol.FileEdit{{Path: "a.ts"}}},
+		apply:    protocol.ApplyResult{Applied: []string{"a.ts"}},
+		simulate: protocol.DiagnosticsResult{Diagnostics: []protocol.Diagnostic{{Path: "a.ts", Message: "boom"}}},
+	}
+	_, client, closeAll := connectedServer(t, fake)
+	defer closeAll()
+
+	result, err := client.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "rename_symbol",
+		Arguments: map[string]any{"path": "a.ts", "line": 1, "character": 2, "new_name": "Person"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("rename error: %#v", result.StructuredContent)
+	}
+	if fake.renameIn.NewName != "Person" || fake.renameIn.Path != "a.ts" || fake.renameIn.Session == "" {
+		t.Fatalf("rename params = %+v", fake.renameIn)
+	}
+	if out := result.StructuredContent.(map[string]any); out["edit_token"] != "tok" {
+		t.Fatalf("rename result = %#v", out)
+	}
+
+	result, err = client.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "apply_edit",
+		Arguments: map[string]any{"edit_token": "tok"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.applyIn.EditToken != "tok" || fake.applyIn.Session == "" {
+		t.Fatalf("apply params = %+v", fake.applyIn)
+	}
+	if out := result.StructuredContent.(map[string]any); out["applied"] == nil {
+		t.Fatalf("apply result = %#v", out)
+	}
+
+	result, err = client.CallTool(context.Background(), &sdk.CallToolParams{
+		Name:      "simulate_edit",
+		Arguments: map[string]any{"path": "a.ts", "new_text": "const x = 1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.simulateIn.Path != "a.ts" || fake.simulateIn.NewText != "const x = 1" || fake.simulateIn.Session == "" {
+		t.Fatalf("simulate params = %+v", fake.simulateIn)
+	}
+	if out := result.StructuredContent.(map[string]any); out["diagnostics"] == nil {
+		t.Fatalf("simulate result = %#v", out)
 	}
 }
 
@@ -106,6 +164,12 @@ type fakeService struct {
 	open       protocol.OpenWorkspaceParams
 	position   protocol.PositionParams
 	definition protocol.LocationsResult
+	rename     protocol.EditPlanResult
+	apply      protocol.ApplyResult
+	simulate   protocol.DiagnosticsResult
+	renameIn   protocol.RenameParams
+	applyIn    protocol.ApplyEditParams
+	simulateIn protocol.SimulateEditParams
 	err        error
 }
 
@@ -141,14 +205,17 @@ func (f *fakeService) WorkspaceSymbols(context.Context, protocol.WorkspaceSymbol
 func (f *fakeService) GetDiagnostics(context.Context, protocol.DiagnosticsParams) (protocol.DiagnosticsResult, error) {
 	return protocol.DiagnosticsResult{}, f.err
 }
-func (f *fakeService) RenameSymbol(context.Context, protocol.RenameParams) (protocol.EditPlanResult, error) {
-	return protocol.EditPlanResult{}, errors.New("not used")
+func (f *fakeService) RenameSymbol(_ context.Context, p protocol.RenameParams) (protocol.EditPlanResult, error) {
+	f.renameIn = p
+	return f.rename, f.err
 }
-func (f *fakeService) ApplyEdit(context.Context, protocol.ApplyEditParams) (protocol.ApplyResult, error) {
-	return protocol.ApplyResult{}, errors.New("not used")
+func (f *fakeService) ApplyEdit(_ context.Context, p protocol.ApplyEditParams) (protocol.ApplyResult, error) {
+	f.applyIn = p
+	return f.apply, f.err
 }
-func (f *fakeService) SimulateEdit(context.Context, protocol.SimulateEditParams) (protocol.DiagnosticsResult, error) {
-	return protocol.DiagnosticsResult{}, errors.New("not used")
+func (f *fakeService) SimulateEdit(_ context.Context, p protocol.SimulateEditParams) (protocol.DiagnosticsResult, error) {
+	f.simulateIn = p
+	return f.simulate, f.err
 }
 func (f *fakeService) IndexStatus(context.Context, protocol.IndexStatusParams) (protocol.IndexStatusResult, error) {
 	return protocol.IndexStatusResult{}, f.err

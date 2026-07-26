@@ -568,6 +568,10 @@ func (w *Workspace) applyFileEdits(ctx context.Context, file protocol.FileEdit) 
 	if err := os.WriteFile(abs, []byte(content), info.Mode().Perm()); err != nil {
 		return protocol.NewErrorf(protocol.ErrInternal, "writing %s: %v", file.Path, err)
 	}
+	// Real disk change: any session overlay for this path is now wrong.
+	if w.overlays != nil {
+		w.overlays.invalidatePath(file.Path)
+	}
 
 	// The language server is now holding the pre-edit text. Forget our record
 	// so the next query notices and reopens (ensureDocumentLocked).
@@ -594,15 +598,27 @@ func (w *Workspace) applyFileEdits(ctx context.Context, file protocol.FileEdit) 
 // SimulateEdit reports the diagnostics a file WOULD produce with different
 // text, writing nothing to disk (SPEC §4.2).
 //
-// Isolation between callers is achieved by serialisation, not by parallel
-// state: lsp.Server.WithText holds the per-(server, path) lock for the whole
-// call and restores the base text before releasing it, so a concurrent
-// get_diagnostics for the same file can never observe another session's
-// speculative text (docs/ARCHITECTURE.md §6.6).
-func (w *Workspace) SimulateEdit(ctx context.Context, _ protocol.SessionID, path, newText string) ([]protocol.Diagnostic, bool, error) {
+// The new text is stored as a per-session overlay (TTL-bounded, dropped on
+// disconnect, invalidated on real file change). Isolation between callers is
+// achieved by serialisation, not by parallel language-server state:
+// lsp.Server.WithText holds the per-(server, path) lock for the whole call and
+// restores the base text before releasing it, so a concurrent get_diagnostics
+// for the same file can never observe another session's speculative text
+// (docs/ARCHITECTURE.md §6.6).
+func (w *Workspace) SimulateEdit(ctx context.Context, sid protocol.SessionID, path, newText string) ([]protocol.Diagnostic, bool, error) {
 	srv, rel, _, err := w.prepare(ctx, path)
 	if err != nil {
 		return nil, false, err
+	}
+
+	diskHash, ok := w.hashFile(rel)
+	if !ok {
+		return nil, false, protocol.NewErrorf(protocol.ErrWorkspaceUnknown, "reading %s for speculative edit", rel)
+	}
+	if w.overlays != nil {
+		// A fresh simulate always establishes a new view against the current
+		// disk baseline, replacing any prior (including stale) entry.
+		w.overlays.put(sid, rel, newText, diskHash)
 	}
 
 	var (
@@ -623,13 +639,65 @@ func (w *Workspace) SimulateEdit(ctx context.Context, _ protocol.SessionID, path
 	// Forgetting our record of the document is what closes that window: the next
 	// query sees a mismatch, reopens, and settles against a fresh epoch. It is
 	// deliberately done even when fn failed, because the speculative push
-	// happened either way.
+	// happened either way. The session overlay remains in memory so a later
+	// get_diagnostics for this session can re-apply it under WithText.
 	w.forgetDocument(ctx, rel)
 
 	if err != nil {
 		return nil, false, protocol.AsError(err)
 	}
 	return nonNilDiagnostics(diags), stale, nil
+}
+
+// diagnosticsThroughOverlay answers get_diagnostics against a session's
+// speculative text when one is live. ok is false when no overlay applies.
+func (w *Workspace) diagnosticsThroughOverlay(ctx context.Context, sid protocol.SessionID, rel string) ([]protocol.Diagnostic, bool, bool, error) {
+	if w.overlays == nil || sid == "" {
+		return nil, false, false, nil
+	}
+	text, wantHash, ok, err := w.overlays.live(sid, rel)
+	if err != nil {
+		return nil, false, true, err
+	}
+	if !ok {
+		return nil, false, false, nil
+	}
+	gotHash, hashOK := w.hashFile(rel)
+	if !hashOK || gotHash != wantHash {
+		// Disk moved without a watcher signal (or between mark and use). Treat
+		// it like InvalidatePath so the agent re-simulates.
+		w.overlays.invalidatePath(rel)
+		_, _, _, err := w.overlays.live(sid, rel)
+		if err == nil {
+			err = protocol.NewErrorf(protocol.ErrStaleEdit,
+				"speculative overlay for %s was invalidated by a disk change", rel)
+		}
+		return nil, false, true, err
+	}
+
+	srv, err := w.serverFor(ctx, rel)
+	if err != nil {
+		return nil, false, true, err
+	}
+	// prepare opens from disk; we need the document open before WithText.
+	if _, _, _, err := w.prepare(ctx, rel); err != nil {
+		return nil, false, true, err
+	}
+
+	var (
+		diags []protocol.Diagnostic
+		stale bool
+	)
+	err = srv.WithText(ctx, rel, text, func(ctx context.Context, epoch uint64) error {
+		var innerErr error
+		diags, stale, innerErr = srv.Diagnostics(ctx, rel, epoch)
+		return innerErr
+	})
+	w.forgetDocument(ctx, rel)
+	if err != nil {
+		return nil, false, true, protocol.AsError(err)
+	}
+	return nonNilDiagnostics(diags), stale, true, nil
 }
 
 // forgetDocument drops our record of what the server holds for rel, so the next

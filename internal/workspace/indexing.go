@@ -256,6 +256,9 @@ func (w *Workspace) handleWatchBatch(batch watch.Batch) {
 		if err != nil {
 			continue
 		}
+		if w.overlays != nil {
+			w.overlays.invalidatePath(rel)
+		}
 		if err := w.deleteIndexedPath(w.indexCtx, rel); err != nil {
 			w.failIndexPath(rel, err)
 		}
@@ -504,8 +507,12 @@ func (w *Workspace) deletePathLocked(ctx context.Context, rel string) error {
 
 // invalidateAndQueue is the shared watcher/query/edit write barrier. The
 // persisted rows are invalidated before the generation is advanced and before
-// replacement work becomes visible to the worker.
+// replacement work becomes visible to the worker. Speculative overlays for the
+// path are marked stale on every call (SPEC §4.2 cache-kill-on-change).
 func (w *Workspace) invalidateAndQueue(ctx context.Context, rel string, admit bool) error {
+	if w.overlays != nil {
+		w.overlays.invalidatePath(rel)
+	}
 	if w.store == nil {
 		return nil
 	}

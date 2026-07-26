@@ -35,6 +35,7 @@ func NewServer(svc protocol.Service, root string) *Server {
 	})
 	s.registerNavigationTools()
 	s.registerSessionTools()
+	s.registerEditTools()
 	return s
 }
 

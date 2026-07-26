@@ -859,6 +859,95 @@ func TestSimulateEditNeverTouchesDisk(t *testing.T) {
 	}
 }
 
+// TestTwoSessionsOverlaysAreIsolated is SPEC §4.2: two sessions simulating
+// edits to the same file see only their own overlay.
+func TestTwoSessionsOverlaysAreIsolated(t *testing.T) {
+	h := newHarness(t)
+	const other = protocol.SessionID("session-2")
+	ctx := context.Background()
+
+	// Session 1's overlay text is what the fake records in withTextSeen.
+	if _, _, err := h.ws.SimulateEdit(ctx, sess, "src/user.ts", "session-one-text"); err != nil {
+		t.Fatalf("session1 SimulateEdit: %v", err)
+	}
+	if _, _, err := h.ws.SimulateEdit(ctx, other, "src/user.ts", "session-two-text"); err != nil {
+		t.Fatalf("session2 SimulateEdit: %v", err)
+	}
+
+	h.srv.mu.Lock()
+	seen := append([]string(nil), h.srv.withTextSeen...)
+	h.srv.mu.Unlock()
+	if len(seen) < 2 || seen[0] != "session-one-text" || seen[1] != "session-two-text" {
+		t.Fatalf("WithText sequence = %v, want each session's own overlay", seen)
+	}
+
+	// get_diagnostics for each session re-applies only that session's text.
+	h.srv.mu.Lock()
+	h.srv.withTextSeen = nil
+	h.srv.mu.Unlock()
+	if _, _, err := h.ws.Diagnostics(ctx, sess, "src/user.ts"); err != nil {
+		t.Fatalf("session1 Diagnostics: %v", err)
+	}
+	if _, _, err := h.ws.Diagnostics(ctx, other, "src/user.ts"); err != nil {
+		t.Fatalf("session2 Diagnostics: %v", err)
+	}
+	h.srv.mu.Lock()
+	seen = append([]string(nil), h.srv.withTextSeen...)
+	h.srv.mu.Unlock()
+	if len(seen) != 2 || seen[0] != "session-one-text" || seen[1] != "session-two-text" {
+		t.Fatalf("diagnostics WithText sequence = %v, want isolated overlays", seen)
+	}
+}
+
+// TestOverlayInvalidatedByDiskChangeReturnsStaleEdit on the next diagnostics
+// use of that session's overlay (SPEC §4.2).
+func TestOverlayInvalidatedByDiskChangeReturnsStaleEdit(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, _, err := h.ws.SimulateEdit(ctx, sess, "src/user.ts", "export interface User { }\n"); err != nil {
+		t.Fatalf("SimulateEdit: %v", err)
+	}
+
+	write(t, h.root, "src/user.ts", "export interface User {\n  id: string;\n  name: string;\n}\n")
+	// Without a watcher (no store), the disk-hash check on next use is the
+	// safety net that surfaces STALE_EDIT.
+	_, _, err := h.ws.Diagnostics(ctx, sess, "src/user.ts")
+	wantCode(t, err, protocol.ErrStaleEdit)
+}
+
+// TestEndSessionDropsOverlays is SPEC §4.2: overlays are dropped on disconnect.
+func TestEndSessionDropsOverlays(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, _, err := h.ws.SimulateEdit(ctx, sess, "src/user.ts", "overlay"); err != nil {
+		t.Fatalf("SimulateEdit: %v", err)
+	}
+	if h.ws.overlays.count() != 1 {
+		t.Fatalf("overlay count = %d, want 1", h.ws.overlays.count())
+	}
+
+	h.ws.EndSession(ctx, sess)
+	if h.ws.overlays.count() != 0 {
+		t.Fatalf("overlay count after EndSession = %d, want 0", h.ws.overlays.count())
+	}
+
+	// Diagnostics without an overlay must not try to re-apply speculative text.
+	h.srv.mu.Lock()
+	h.srv.withTextSeen = nil
+	h.srv.mu.Unlock()
+	if _, _, err := h.ws.Diagnostics(ctx, sess, "src/user.ts"); err != nil {
+		t.Fatalf("Diagnostics after EndSession: %v", err)
+	}
+	h.srv.mu.Lock()
+	seen := len(h.srv.withTextSeen)
+	h.srv.mu.Unlock()
+	if seen != 0 {
+		t.Fatalf("Diagnostics re-applied an overlay after EndSession (%d WithText calls)", seen)
+	}
+}
+
 func TestDiagnosticsForOnePath(t *testing.T) {
 	h := newHarness(t)
 	h.srv.diags = []protocol.Diagnostic{{Path: "src/user.ts", Severity: protocol.SeverityError, Message: "TS2339"}}

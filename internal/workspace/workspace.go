@@ -73,6 +73,12 @@ type Workspace struct {
 	docs  map[string]*docState
 	plans map[string]editPlan
 	order []string // plan tokens, oldest first
+
+	// overlays holds per-session speculative text (SPEC §4.2 / M5).
+	overlays      *overlays
+	cancelOverlay context.CancelFunc
+	// overlayWG joins the clock-driven TTL sweeper on shutdown.
+	overlayWG sync.WaitGroup
 }
 
 // docState is what the language server currently believes about a file.
@@ -143,10 +149,16 @@ func newWorkspace(ctx context.Context, id protocol.WorkspaceID, root string, opt
 		pending:        map[string]uint64{},
 		failed:         map[string]*protocol.Error{},
 		known:          map[string]struct{}{},
-		indexState:     protocol.IndexIdle,
+		indexState: protocol.IndexIdle,
+		overlays:   newOverlays(opts.Clock, opts.OverlayTTL),
 	}
+	overlayCtx, cancelOverlay := context.WithCancel(context.Background())
+	w.cancelOverlay = cancelOverlay
+	w.startOverlaySweep(overlayCtx)
 	if opts.Store != nil {
 		if err := w.startIndex(ctx, opts); err != nil {
+			cancelOverlay()
+			w.overlayWG.Wait()
 			_ = sup.Shutdown(context.Background())
 			return nil, err
 		}
@@ -214,6 +226,11 @@ func (w *Workspace) CloseDocument(ctx context.Context, sid protocol.SessionID, p
 
 // EndSession releases everything sid owns in this workspace. Idempotent.
 func (w *Workspace) EndSession(ctx context.Context, sid protocol.SessionID) {
+	// SPEC §4.2: overlays are dropped when the session disconnects.
+	if w.overlays != nil {
+		w.overlays.dropSession(sid)
+	}
+
 	w.mu.Lock()
 	paths := make([]string, 0, len(w.docs))
 	for rel, st := range w.docs {
@@ -474,7 +491,11 @@ func (w *Workspace) WorkspaceSymbols(ctx context.Context, _ protocol.SessionID, 
 }
 
 // Diagnostics answers get_diagnostics. An empty path means the whole workspace.
-func (w *Workspace) Diagnostics(ctx context.Context, _ protocol.SessionID, path string) ([]protocol.Diagnostic, bool, error) {
+//
+// When the caller has a live speculative overlay for the path, diagnostics are
+// computed against that text (SPEC §4.2 session isolation) and nothing is
+// written to disk. A stale overlay returns STALE_EDIT.
+func (w *Workspace) Diagnostics(ctx context.Context, sid protocol.SessionID, path string) ([]protocol.Diagnostic, bool, error) {
 	if path == "" {
 		if w.store != nil {
 			w.cacheMu.RLock()
@@ -500,6 +521,10 @@ func (w *Workspace) Diagnostics(ctx context.Context, _ protocol.SessionID, path 
 	if err != nil {
 		return nil, false, err
 	}
+	if diags, stale, ok, err := w.diagnosticsThroughOverlay(ctx, sid, rel); ok || err != nil {
+		return diags, stale, err
+	}
+
 	var cachedDiagnostics []protocol.Diagnostic
 	cacheEligible, err := w.cacheEligibleFile(rel)
 	if err != nil {
@@ -635,6 +660,10 @@ func (w *Workspace) Status(ctx context.Context) (protocol.IndexStatusResult, err
 
 func (w *Workspace) shutdown(ctx context.Context) error {
 	w.shutdownOnce.Do(func() {
+		if w.cancelOverlay != nil {
+			w.cancelOverlay()
+		}
+		w.overlayWG.Wait()
 		if w.cancelIndex != nil {
 			w.cancelIndex()
 			w.indexWG.Wait()
@@ -642,6 +671,27 @@ func (w *Workspace) shutdown(ctx context.Context) error {
 		w.shutdownErr = w.sup.Shutdown(ctx)
 	})
 	return w.shutdownErr
+}
+
+// startOverlaySweep runs ONE clock-driven goroutine that reaps TTL-expired
+// overlays. Never a timer per overlay (docs/ARCHITECTURE.md §5.7).
+func (w *Workspace) startOverlaySweep(ctx context.Context) {
+	w.overlayWG.Add(1)
+	go func() {
+		defer w.overlayWG.Done()
+		ticker := w.clock.NewTicker(overlaySweepPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C():
+				if w.overlays != nil {
+					w.overlays.sweep()
+				}
+			}
+		}
+	}()
 }
 
 // ---- helpers ---------------------------------------------------------------

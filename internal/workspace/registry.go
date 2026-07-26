@@ -45,6 +45,9 @@ type RegistryOptions struct {
 	NewWatcher     func(root string, sc watch.Scanner, ck clock.Clock, debounce time.Duration) (watch.Watcher, error)
 	OnFileActivity func()
 	NewSupervisor  func(lsp.Options) (lsp.Supervisor, error)
+	// OverlayTTL is how long a session's speculative text lives without use
+	// (SPEC §4.2). Zero means defaultOverlayTTL (5 minutes).
+	OverlayTTL time.Duration
 }
 
 func (o *RegistryOptions) applyDefaults() {
@@ -71,6 +74,9 @@ func (o *RegistryOptions) applyDefaults() {
 	}
 	if o.NewSupervisor == nil {
 		o.NewSupervisor = lsp.NewSupervisor
+	}
+	if o.OverlayTTL <= 0 {
+		o.OverlayTTL = defaultOverlayTTL
 	}
 }
 
