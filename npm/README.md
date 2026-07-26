@@ -5,6 +5,9 @@ Thin installer for the [langer](https://github.com/fingerskier/langer) LSP–MCP
 It downloads the platform binary from GitHub Releases into `~/.langer/bin` and
 registers the MCP server with Claude Code, Grok Build, and/or Codex.
 
+**Maintainers** (tag → GitHub Release assets → `npm publish`): see
+[docs/RELEASING.md](../docs/RELEASING.md) in the monorepo.
+
 ## Quickstart
 
 ```powershell
@@ -59,3 +62,26 @@ claude mcp add langer -- langer mcp --stdio
 
 Or grab a release asset from
 https://github.com/fingerskier/langer/releases
+
+## Publishing this package
+
+Binaries are **not** built by npm. GitHub Actions builds them when a `v*` tag is
+pushed; this package only downloads those assets.
+
+1. Set `"version"` in `package.json` to `X.Y.Z` (same as tag `vX.Y.Z`, without `v`).
+2. Ensure the GitHub Release for `vX.Y.Z` already has assets (or publish will
+   leave users with 404 until the tag is cut).
+3. From this directory:
+
+   ```bash
+   npm test
+   npm publish --access public
+   ```
+
+4. Smoke-test:
+
+   ```bash
+   npx -y @fingerskier/langer@X.Y.Z ensure
+   ```
+
+Full checklist and recovery notes: [docs/RELEASING.md](../docs/RELEASING.md).

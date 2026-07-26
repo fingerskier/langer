@@ -5,6 +5,7 @@ hover, diagnostics, renames, and speculative edits — scoped per workspace.
 
 - **[SPEC.md](SPEC.md)** — technical specification  
 - **[PLAN.md](PLAN.md)** — milestone plan and v0.1 verification  
+- **[docs/RELEASING.md](docs/RELEASING.md)** — maintainers: GitHub Release tags + npm publish
 
 ## Why
 
@@ -37,10 +38,13 @@ Details: [`npm/README.md`](npm/README.md).
 
 Restart Claude/Codex after install. For Grok, restart or press `r` in `/mcps`.
 
-> **Note:** `npx` needs a published release asset for your platform. Tag pushes
-> build those via [`.github/workflows/release.yml`](.github/workflows/release.yml).
-> Until assets exist for a tag, use `go install` below or `--binary` pointing at
-> a local build.
+> **Note:** `npx` needs a published [GitHub Release](https://github.com/fingerskier/langer/releases)
+> asset for your platform (built on every `v*` tag) **and** a published
+> `@fingerskier/langer` on npm. Until those exist, use `go install` below or
+> `--binary` pointing at a local build.
+>
+> Maintainers: see **[docs/RELEASING.md](docs/RELEASING.md)** for the tag →
+> Actions → `npm publish` checklist.
 
 ### From source / Go toolchain
 
@@ -91,6 +95,8 @@ On every `v*` tag, CI publishes multi-OS assets:
 
 https://github.com/fingerskier/langer/releases
 
+How tags and `@fingerskier/langer` are published: **[docs/RELEASING.md](docs/RELEASING.md)**.
+
 ## CLI
 
 ```text
@@ -118,6 +124,14 @@ go test -tags=integration ./...
 
 Primary gate: native host OS. Integration tests need
 `typescript-language-server` and `pyright` on `PATH`.
+
+Installer package tests:
+
+```bash
+cd npm && npm test
+```
+
+Cutting a release (binaries + npm): **[docs/RELEASING.md](docs/RELEASING.md)**.
 
 ## License
 

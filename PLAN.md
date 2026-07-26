@@ -406,3 +406,4 @@ tests with build tags for both OS families (M3.5 + prior milestones).
 - Distribution DX: `.github/workflows/release.yml` builds multi-OS assets on
   `v*` tags; `npm/` publishes `@fingerskier/langer` (`npx … install`) after
   `npm publish` from that directory (pair npm version with the git tag).
+  Maintainer procedure: **[docs/RELEASING.md](docs/RELEASING.md)**.

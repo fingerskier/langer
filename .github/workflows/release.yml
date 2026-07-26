@@ -1,3 +1,6 @@
+# Build multi-OS langer binaries and attach them to a GitHub Release.
+# Trigger: push a tag matching v* (e.g. v0.1.1).
+# Maintainer docs: docs/RELEASING.md (pair tag with npm/@fingerskier/langer version).
 name: release
 
 on:
