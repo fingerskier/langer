@@ -28,6 +28,10 @@ coverage.html
 /.env
 /.langer/
 
+# npm package deps (installer lives in npm/; testdata tripwire is separate)
+/npm/node_modules/
+/npm/package-lock.json
+
 # NOTE: node_modules is deliberately NOT ignored. testdata/ts-project ships a
 # committed node_modules/.bin tripwire for the SPEC §9 security test (M6):
 # opening a workspace must never execute a project-local language server.

@@ -403,3 +403,6 @@ tests with build tags for both OS families (M3.5 + prior milestones).
 
 - Race suite on a host with working CGO (or Linux CI).
 - Optional Linux/macOS full integration re-run for dual-OS sign-off paperwork.
+- Distribution DX: `.github/workflows/release.yml` builds multi-OS assets on
+  `v*` tags; `npm/` publishes `@fingerskier/langer` (`npx … install`) after
+  `npm publish` from that directory (pair npm version with the git tag).
