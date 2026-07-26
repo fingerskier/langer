@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -212,6 +213,11 @@ func TestUsageErrorsGoToStderrWithExitTwo(t *testing.T) {
 // TestStatusRuns covers the M0 acceptance criterion "`langer status` runs".
 func TestStatusRuns(t *testing.T) {
 	home := isolate(t)
+	original := queryDaemonStatus
+	queryDaemonStatus = func(context.Context, *config.Config, string) (protocol.IndexStatusResult, error) {
+		return protocol.IndexStatusResult{State: protocol.IndexReady, FilesIndexed: 7, FilesTotal: 7}, nil
+	}
+	t.Cleanup(func() { queryDaemonStatus = original })
 
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"status"}, &stdout, &stderr); code != 0 {
@@ -223,6 +229,8 @@ func TestStatusRuns(t *testing.T) {
 		filepath.Join(home, ".config", "lsp-mcp", "config.toml"),
 		filepath.Join(home, ".local", "share", "lsp-mcp", "index.db"),
 		filepath.Join(home, ".local", "share", "lsp-mcp", "daemon.sock"),
+		"daemon:     connected",
+		"index:      ready (7/7 files)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output is missing %q:\n%s", want, out)
@@ -249,24 +257,25 @@ func TestStatusReportsBadConfig(t *testing.T) {
 	}
 }
 
-// TestStubbedCommandsFailLoudly: mcp is still a stub (M4). It must not pretend
-// to succeed, or a client would hang waiting on a dead pipe.
-//
-// `daemon <root>` was a stub too until M2; it now serves, so it has its own
-// tests below.
-func TestStubbedCommandsFailLoudly(t *testing.T) {
+func TestMCPSubcommandRunsTheFrontendWithoutPollutingInjectedStdout(t *testing.T) {
 	isolate(t)
+	original := serveMCP
+	called := false
+	serveMCP = func(context.Context, *config.Config, string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serveMCP = original })
 
-	for _, args := range [][]string{{"mcp", "--stdio"}} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			if code := run(args, &stdout, &stderr); code != exitFailure {
-				t.Errorf("run(%q) = %d, want %d", args, code, exitFailure)
-			}
-			if !strings.Contains(stderr.String(), "not implemented") {
-				t.Errorf("stub did not say it is unimplemented:\n%s", stderr.String())
-			}
-		})
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"mcp", "--stdio"}, &stdout, &stderr); code != exitOK {
+		t.Fatalf("run(mcp) = %d, want %d: %s", code, exitOK, stderr.String())
+	}
+	if !called {
+		t.Fatal("MCP frontend was not invoked")
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("wrapper polluted output: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

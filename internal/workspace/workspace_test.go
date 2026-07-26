@@ -577,6 +577,18 @@ func TestHoverReturnsTheServerAnswer(t *testing.T) {
 // TestQueryOpensTheDocumentWithDiskText: a language server answers about the
 // text it was given, so the daemon must give it the file that is actually on
 // disk before asking anything about it.
+func TestOpenDocumentReturnsNotReadyWhenInitialAnalysisDidNotSettle(t *testing.T) {
+	h := newHarness(t)
+	h.srv.stale = true
+	err := h.ws.OpenDocument(context.Background(), sess, "src/user.ts", "typescript")
+	if err == nil {
+		t.Fatal("OpenDocument succeeded after the initial analysis timed out")
+	}
+	if code := protocol.AsError(err).Code; code != protocol.ErrNotReady {
+		t.Fatalf("OpenDocument error = %v (code %s), want NOT_READY", err, code)
+	}
+}
+
 func TestQueryOpensTheDocumentWithDiskText(t *testing.T) {
 	h := newHarness(t)
 

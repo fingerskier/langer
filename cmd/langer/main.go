@@ -18,10 +18,15 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/daemon"
+	"github.com/fingerskier/langer/internal/clock"
 	"github.com/fingerskier/langer/internal/daemonctl"
+	"github.com/fingerskier/langer/internal/procx"
+	langermcp "github.com/fingerskier/langer/mcp"
+	"github.com/fingerskier/langer/protocol"
 )
 
 // Exit codes. Usage problems are distinguishable from runtime failures so a
@@ -208,9 +213,29 @@ func parseStatus(args []string) (*invocation, error) {
 	return &invocation{Command: "status"}, nil
 }
 
-// runMCP is the M4 entry point. Stubbed for M0.
+var serveMCP = func(ctx context.Context, cfg *config.Config, root string) error {
+	client, err := daemonctl.Connect(ctx, cfg, root, clock.New(), procx.NewRunner(), daemonctl.Options{Session: "mcp-bootstrap"})
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	return langermcp.NewServer(client, root).Run(ctx)
+}
+
+// runMCP serves the agent-facing MCP protocol on stdin/stdout and keeps every
+// diagnostic/log byte on stderr so stdio framing cannot be corrupted.
 func runMCP(_ *invocation, _, _ io.Writer) error {
-	return errors.New("MCP frontend not implemented yet (milestone M4)")
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveMCP(ctx, cfg, root)
 }
 
 // runDaemon runs the workspace daemon until it is signalled or sunsets
@@ -283,9 +308,22 @@ func logLevel(name string) slog.Level {
 	}
 }
 
-// runStatus reports what M0 can actually know: the resolved configuration and
-// where the daemon's socket and index live. Live daemon and index reporting
-// arrive with M2 and M3.
+var queryDaemonStatus = func(ctx context.Context, cfg *config.Config, root string) (protocol.IndexStatusResult, error) {
+	const session = protocol.SessionID("status")
+	client, err := daemonctl.Connect(ctx, cfg, root, clock.New(), procx.NewRunner(), daemonctl.Options{Session: session})
+	if err != nil {
+		return protocol.IndexStatusResult{}, err
+	}
+	defer client.Close()
+	defer client.EndSession(context.Background(), protocol.EndSessionParams{Session: session})
+	opened, err := client.OpenWorkspace(ctx, protocol.OpenWorkspaceParams{Session: session, Root: root})
+	if err != nil {
+		return protocol.IndexStatusResult{}, err
+	}
+	return client.IndexStatus(ctx, protocol.IndexStatusParams{Session: session, Workspace: opened.Workspace})
+}
+
+// runStatus reports resolved configuration plus live daemon/index state.
 func runStatus(_ *invocation, stdout io.Writer) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -319,6 +357,16 @@ func runStatus(_ *invocation, stdout io.Writer) error {
 			fmt.Fprintf(stdout, "server:     %s -> %s %s\n", ls.Name, ls.Command, strings.Join(ls.Args, " "))
 		}
 	}
-	fmt.Fprintf(stdout, "daemon:     unknown (daemon IPC arrives in milestone M2)\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	status, err := queryDaemonStatus(ctx, cfg, cwd)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "daemon:     connected\n")
+	fmt.Fprintf(stdout, "index:      %s (%d/%d files)\n", status.State, status.FilesIndexed, status.FilesTotal)
+	for _, server := range status.LanguageServers {
+		fmt.Fprintf(stdout, "language:   %s — %s\n", server.Name, server.State)
+	}
 	return nil
 }

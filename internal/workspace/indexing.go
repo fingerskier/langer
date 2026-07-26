@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/fingerskier/langer/index"
 	"github.com/fingerskier/langer/internal/watch"
@@ -572,6 +573,17 @@ func (w *Workspace) runIndexWorker() {
 				for {
 					next, err := w.indexOne(job)
 					if err != nil {
+						structured := protocol.AsError(err)
+						if structured.Code == protocol.ErrNotReady && w.indexCtx.Err() == nil {
+							delay := time.Duration(structured.RetryAfterMS) * time.Millisecond
+							if delay <= 0 {
+								delay = 250 * time.Millisecond
+							}
+							if w.clock.Sleep(w.indexCtx, delay) != nil {
+								return
+							}
+							continue
+						}
 						if w.indexCtx.Err() == nil {
 							w.failIndexJob(job, err)
 						}

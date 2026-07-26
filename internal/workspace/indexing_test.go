@@ -579,7 +579,7 @@ func TestFreshDocumentSymbolsAndReferencesUseTheCompleteCache(t *testing.T) {
 	}
 }
 
-func TestReferencesBypassCacheWhileWorkspaceIndexIsNotReady(t *testing.T) {
+func TestReferencesAreNotReadyWhileWorkspaceIndexIsIncomplete(t *testing.T) {
 	h := newIndexedHarness(t, nil)
 	file := waitForPut(t, h.store.puts)
 	waitForReady(t, h.ws)
@@ -602,23 +602,23 @@ func TestReferencesBypassCacheWhileWorkspaceIndexIsNotReady(t *testing.T) {
 	h.ws.indexState = protocol.IndexIndexing
 	h.ws.indexMu.Unlock()
 
-	refs, err := h.ws.References(
+	_, err := h.ws.References(
 		context.Background(),
 		sess,
 		"src/user.ts",
 		protocol.Position{Line: 0, Character: 18},
 	)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("References returned a potentially partial live answer while indexing")
 	}
-	if len(refs) != 1 || refs[0].Path != "src/live.ts" {
-		t.Fatalf("references = %+v, want live fallback while workspace is not ready", refs)
+	if code := protocol.AsError(err).Code; code != protocol.ErrNotReady {
+		t.Fatalf("References error = %v (code %s), want NOT_READY", err, code)
 	}
 	h.srv.mu.Lock()
 	afterCalls := h.srv.referenceCalls
 	h.srv.mu.Unlock()
-	if afterCalls != beforeCalls+1 {
-		t.Fatalf("live reference calls = %d -> %d, want one call", beforeCalls, afterCalls)
+	if afterCalls != beforeCalls {
+		t.Fatalf("live reference calls = %d -> %d; an incomplete answer must not escape", beforeCalls, afterCalls)
 	}
 }
 

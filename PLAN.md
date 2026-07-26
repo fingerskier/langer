@@ -45,8 +45,8 @@
 | M2 — daemon process | **done**, reviewed + fixed | `da65ee8` + fixes |
 | M3 — SQLite index | **done**, reviewed + race-hardened | `49fc074` |
 | M3.5 — Windows host gate (process + local IPC) | **done** | this commit |
-| M4 — MCP frontend | **next** | |
-| M5 — edits & speculative overlays | not started | |
+| M4 — MCP frontend | **done** | this commit |
+| M5 — edits & speculative overlays | **next** | |
 | M6 — security, dual-platform sign-off | not started | |
 
 M0–M3 verification was completed in the pinned Go 1.26.5 **Linux Docker**
@@ -63,6 +63,20 @@ plain + integration vet, unit, race, and real-server integration gates. An
 actual built `langer.exe` was auto-started concurrently by two clients and both
 reached the same daemon/workspace. Optional Linux Docker build, vet, unit, and
 race gates also passed.
+
+M4 landed the thin stdio MCP frontend with the owner-approved nine-tool
+navigation/session/index surface. Every call derives its session identity,
+opens the configured root through `protocol.Service`, returns structured SPEC
+§3.6 errors without leaking Go errors, and teaches retry on `NOT_READY`.
+End-to-end MCP integration builds the real binary and verifies definition,
+references, and hover on both TypeScript and Python fixtures. That test exposed
+and fixed an initial-analysis timeout that had returned a plausible but wrong
+TypeScript import location; semantic queries now return `NOT_READY` until the
+first analysis settles. Completeness-sensitive references likewise return
+`NOT_READY` while the workspace index is incomplete, and transient indexing
+readiness failures retry instead of becoming terminal failed snapshots. Native
+Windows build, vet, unit, race, and real-server integration gates passed, as did
+optional Linux Docker build/vet/unit/race.
 
 M0–M2 were each adversarially reviewed after implementation. That found real
 defects the passing test suite did not, and the pattern is worth keeping: in
@@ -280,15 +294,18 @@ required to close M3.5.
 
 ### M4 — MCP frontend (`mcp/`)
 
-- MCP server over stdio exposing exactly the nine ✅ tools (SPEC §4.2) with
-  result shapes from SPEC §4.4; auto-starts the workspace daemon on demand.
+- MCP server over stdio exposing exactly nine tools: the six navigation /
+  intelligence tools marked ✅ in SPEC §4.2 plus `open_document`,
+  `close_document`, and `index_status`; auto-starts the workspace daemon on
+  demand. M5 adds the three ✅ edit/speculative tools once overlay semantics
+  are complete, producing the final twelve-tool v0.1 surface.
 - `open_document` / `close_document` / `index_status` plumbing.
 - Tool descriptions must teach agents to **retry on `NOT_READY`** and never
   treat empty lists as definitive while the index is incomplete.
 - Primary gate: **native Windows** (M3.5 must already be green).
 
 **Accept:** SPEC §11 navigation criteria pass end-to-end via MCP on both
-fixture projects; `claude mcp add langer -- langer mcp --stdio` (or equivalent
+fixture projects; the exact nine-tool M4 set is asserted; `claude mcp add langer -- langer mcp --stdio` (or equivalent
 host) works against a local Windows checkout (manual verification note in the
 milestone commit).
 

@@ -199,6 +199,10 @@ func (w *Workspace) lockDoc(ctx context.Context, rel string) (func(), error) {
 // against (SPEC §4.3), because the caller that needs it must not re-do the
 // whole read-and-compare to get it.
 func (w *Workspace) prepare(ctx context.Context, path string) (lsp.Server, string, uint64, error) {
+	return w.prepareWithSettle(ctx, path, true)
+}
+
+func (w *Workspace) prepareWithSettle(ctx context.Context, path string, requireSettled bool) (lsp.Server, string, uint64, error) {
 	rel, err := w.relPath(path)
 	if err != nil {
 		return nil, "", 0, err
@@ -217,7 +221,7 @@ func (w *Workspace) prepare(ctx context.Context, path string) (lsp.Server, strin
 	}
 	defer unlock()
 
-	epoch, err := w.ensureDocumentLocked(ctx, srv, rel, "")
+	epoch, err := w.ensureDocumentLocked(ctx, srv, rel, "", requireSettled)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -235,7 +239,7 @@ func (w *Workspace) prepare(ctx context.Context, path string) (lsp.Server, strin
 // and wrongly, which is worse than any error.
 //
 // The caller must hold lockDoc(rel).
-func (w *Workspace) ensureDocumentLocked(ctx context.Context, srv lsp.Server, rel, languageID string) (uint64, error) {
+func (w *Workspace) ensureDocumentLocked(ctx context.Context, srv lsp.Server, rel, languageID string, requireSettled bool) (uint64, error) {
 	text, err := w.readDocument(rel)
 	if err != nil {
 		return 0, err
@@ -264,7 +268,9 @@ func (w *Workspace) ensureDocumentLocked(ctx context.Context, srv lsp.Server, re
 	}
 
 	if pushed {
-		w.awaitAnalysis(ctx, srv, rel, epoch)
+		if err := w.awaitAnalysis(ctx, srv, rel, epoch); err != nil && requireSettled {
+			return 0, err
+		}
 	}
 
 	w.mu.Lock()
@@ -298,17 +304,17 @@ func (w *Workspace) ensureDocumentLocked(ctx context.Context, srv lsp.Server, re
 // Its limits are honest: settling on file A proves the server built a program
 // containing A and its imports, not that it has read every file in the
 // workspace. The complete answer is the SPEC §3.4 index, which arrives in M3.
-func (w *Workspace) awaitAnalysis(ctx context.Context, srv lsp.Server, rel string, epoch uint64) {
+func (w *Workspace) awaitAnalysis(ctx context.Context, srv lsp.Server, rel string, epoch uint64) error {
 	if !srv.Supports(lsp.CapPushDiagnostics) {
-		return
+		return nil
 	}
-	// A settle failure is not a query failure: the caller asked about symbols,
-	// not diagnostics, and the query below reports its own errors properly.
 	if _, stale, err := srv.Diagnostics(ctx, rel, epoch); err != nil {
-		w.log.Debug("waiting for the first analysis failed", "path", rel, "error", err)
+		return protocol.AsError(err)
 	} else if stale {
-		w.log.Debug("the first analysis did not settle within the budget", "path", rel)
+		return protocol.NewError(protocol.ErrNotReady,
+			"initial language-server analysis has not settled; retry").WithRetryAfterMS(250)
 	}
+	return nil
 }
 
 // readDocument reads a workspace file, mapping a missing or unreadable path

@@ -68,7 +68,7 @@ exists on this machine. `go build ./...`, `go vet ./...`, `go test ./...` and
 | Diagnostic `source` | Verbatim from the server, including case: `"typescript"`, `"Pyright"`. | §10.5 |
 | `document_symbols` shape | **Flat list**; hierarchy is carried by the `container` string. No `children` field. | §10.4 |
 | `possibly_stale` | A field of the **diagnostics result envelope**, not of an individual diagnostic. | §10.8 |
-| MCP tool set | Exactly **12**: the nine ✅ SPEC §4.2 tools + `open_document`, `close_document`, `index_status` (PLAN M4). Never `reindex` or `list_language_servers`. | §5.10 |
+| MCP tool set | M4 exposes exactly **9**: six navigation/intelligence tools + `open_document`, `close_document`, `index_status`. M5 adds three edit/speculative tools for the final **12**. Never `reindex` or `list_language_servers`. | §5.10 |
 | Repository namespace | Normalized path slug from system-Git `origin` (normally `<org>/<name>`, deeper namespaces preserved); canonical CLI-supplied workspace root, normally cwd, is the no-origin fallback. No network lookup. | SPEC §3.2, §10.14 |
 | Cached symbol identity | `stable_key` remains descriptive/non-unique. References use workspace-scoped `symbol_key = repo_namespace + "\x1f" + definition_path + "\x1f" + stable_key`; residual same-file ambiguity goes live. | SPEC §5.2, §10.14 |
 | Cache completeness | Hash-matching per-file rows only. Incomplete workspace/reference sets return `NOT_READY`, never partial success. | SPEC §3.4, §10.15 |
@@ -1589,21 +1589,18 @@ func Connect(ctx context.Context, cfg *config.Config, root string, ck clock.Cloc
 ```go
 package mcp
 
-// Server registers EXACTLY TWELVE tools over stdio, and no others. A test
+// Server registers EXACTLY NINE tools over stdio in M4, and no others. A test
 // asserts the tool-name set literally, as a sorted slice.
 //
-// The nine ✅ v0.1 tools of SPEC §4.2 (PLAN ground rule 3):
+// The six navigation/intelligence tools marked ✅ in SPEC §4.2:
 //   get_definition, get_references, get_hover, document_symbols,
-//   workspace_symbols, get_diagnostics, rename_symbol, apply_edit,
-//   simulate_edit
+//   workspace_symbols, get_diagnostics
 //
-// Plus the three Session & Index tools PLAN M4 names as deliverables
-// ("open_document / close_document / index_status plumbing"):
+// Plus the three Session & Index tools PLAN M4 names as deliverables:
 //   open_document, close_document, index_status
 //
-// SPEC §4.2's "Session & Index" table carries NO v0.1 column, so "the nine ✅
-// tools" and these three are disjoint statements, not a contradiction: the nine
-// is the count of ✅-marked tools, and PLAN M4 separately requires these three.
+// M5 adds rename_symbol, apply_edit, and simulate_edit only after complete
+// overlay semantics exist, producing the final twelve-tool v0.1 surface.
 //
 // NOT registered, in v0.1: reindex and list_language_servers (SPEC §4.2
 // Session & Index, unclaimed by any PLAN milestone), and every unmarked tool
@@ -1856,7 +1853,7 @@ children inherit their own pipes — keep them separated.
 | **M2** | `daemon`, `internal/daemonctl`, `internal/workspace` (live-query only) | `protocol` (§4.2–4.4), `cmd/langer` (`runDaemon`) | two concurrent clients on one daemon; killing a language server does not kill the daemon; idle sunset with the fake clock; version-mismatch drain-and-restart; **every SPEC §3.6 code exercised** |
 | **M3** | `index`, `internal/watch` | `lsp` + `lsp/wire` (internal selection range and disk-text serialization), `protocol` (failed index status), `internal/workspace` (watcher-first index-vs-live), `daemon` (Store/GC/activity wiring), `internal/deps` (drop sqlite + fsnotify), `cmd/langer` (import-rule test rules 1 and 3) | origin namespace + canonical-root fallback; collision-safe symbol keys; atomic complete reference replacement; watcher/scan race discard; structured failure; timed GC lease/retention; edit reflected without full re-index; restart survival |
 | **M3.5** | `internal/filelock`; Windows platform files in `internal/procx` | `config`, `daemon`, `internal/daemonctl`, `index`, `lsp/wire` | native Windows build/vet/unit/race/integration gates; process-tree cleanup; daemon auto-start and two-client AF_UNIX smoke |
-| **M4** | `mcp` | `cmd/langer` (`runMCP`, live `runStatus`), `internal/deps` (delete the package) | SPEC §11 navigation criteria end-to-end via MCP on both fixtures; exact nine-tool set asserted; no handler returns a Go error |
+| **M4** | `mcp` | `cmd/langer` (`runMCP`, live `runStatus`), `internal/deps` (delete the package) | SPEC §11 navigation criteria end-to-end via MCP on both fixtures; exact nine-tool navigation/session/index set asserted; no handler returns a Go error |
 | **M5** | — | `internal/workspace` (overlays, edit tokens), `mcp` (rename/apply/simulate), `daemon` (session lifecycle) | rename round-trip; `STALE_EDIT` after an out-of-band change; two sessions' overlays isolated; overlay diagnostics accurate with nothing written to disk |
 | **M6** | — | `daemon` + `internal/daemonctl` + `internal/procx` (permissions and cross-platform hardening), `index` | tripwire; platform permission checks; process-tree cleanup revalidation; Windows + Unix full SPEC §11 sign-off |
 
@@ -2005,6 +2002,9 @@ mcp/tools_nav.go                     mcp/tools_nav_test.go
 mcp/tools_session.go                 mcp/tools_session_test.go
 mcp/result.go                        mcp/result_test.go
 mcp/integration_test.go              (//go:build integration)
+internal/workspace/query.go           internal/workspace/workspace.go
+internal/workspace/indexing.go        internal/workspace/indexing_test.go
+internal/workspace/workspace_test.go  (completeness-sensitive NOT_READY and transient indexing retry only)
 cmd/langer/main.go                   (runMCP + live runStatus ONLY)
 internal/deps/                       (DELETE the package)
 ```

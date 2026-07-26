@@ -8,6 +8,7 @@ import (
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/index"
+	"github.com/fingerskier/langer/internal/clock"
 	"github.com/fingerskier/langer/internal/watch"
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/protocol"
@@ -23,11 +24,12 @@ const maxRememberedPlans = 64
 // Every exported method returns either a value or a *protocol.Error: nothing
 // unstructured escapes (SPEC §3.6).
 type Workspace struct {
-	id   protocol.WorkspaceID
-	root string
-	cfg  *config.Config
-	sup  lsp.Supervisor
-	log  *slog.Logger
+	id    protocol.WorkspaceID
+	root  string
+	cfg   *config.Config
+	sup   lsp.Supervisor
+	log   *slog.Logger
+	clock clock.Clock
 
 	store          index.Store
 	scanner        watch.Scanner
@@ -129,6 +131,7 @@ func newWorkspace(ctx context.Context, id protocol.WorkspaceID, root string, opt
 		cfg:            opts.Config,
 		sup:            sup,
 		log:            log,
+		clock:          opts.Clock,
 		store:          opts.Store,
 		scanner:        scanner,
 		repoNamespace:  repoNamespace,
@@ -179,7 +182,7 @@ func (w *Workspace) OpenDocument(ctx context.Context, sid protocol.SessionID, pa
 	}
 	defer unlock()
 
-	if _, err := w.ensureDocumentLocked(ctx, srv, rel, languageID); err != nil {
+	if _, err := w.ensureDocumentLocked(ctx, srv, rel, languageID, true); err != nil {
 		return err
 	}
 
@@ -295,14 +298,14 @@ func (w *Workspace) References(ctx context.Context, _ protocol.SessionID, path s
 		return nil, err
 	}
 	if cacheEligible {
+		// References are completeness-sensitive. While the workspace index is
+		// incomplete, a live language server can return a plausible subset that
+		// an agent cannot distinguish from the full call graph. Require the
+		// workspace barrier and teach the MCP caller to retry NOT_READY instead.
+		if err := w.requireReady(); err != nil {
+			return nil, err
+		}
 		fresh, err := w.readFreshCache(ctx, rel, func() error {
-			// A reference set is workspace-wide even though the cursor is in
-			// one fresh file. Restart staging, watcher failure, or any pending
-			// replacement lowers the workspace barrier and forces a live
-			// answer without invalidating this otherwise-fresh definition.
-			if err := w.requireReady(); err != nil {
-				return nil
-			}
 			key, unique, err := w.store.SymbolKeyAt(ctx, w.id, rel, pos)
 			if err != nil {
 				return err
@@ -516,7 +519,7 @@ func (w *Workspace) Diagnostics(ctx context.Context, _ protocol.SessionID, path 
 		}
 	}
 
-	srv, rel, epoch, err := w.prepare(ctx, path)
+	srv, rel, epoch, err := w.prepareWithSettle(ctx, path, false)
 	if err != nil {
 		return nil, false, err
 	}
