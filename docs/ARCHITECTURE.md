@@ -1,7 +1,8 @@
-# langer — Architecture Contract (FROZEN, M3 AMENDED)
+# langer — Architecture Contract (FROZEN, M3.5 AMENDED)
 
 **Status:** FROZEN for v0.1 (milestones M1–M6), with the owner-approved M3
-identity/indexing amendment of 2026-07-25 incorporated.
+identity/indexing amendment of 2026-07-25 and M3.5 Windows-primary platform
+amendment of 2026-07-26 incorporated.
 **Authority:** `SPEC.md` v0.4 is authoritative. This document is subordinate to it.
 Where this document adds something the spec does not state, it is marked
 **[SPEC-ADDITION]** and listed in §11. Nothing here may override SPEC.md.
@@ -51,7 +52,7 @@ exists on this machine. `go build ./...`, `go vet ./...`, `go test ./...` and
 |---|---|
 | Module | `github.com/fingerskier/langer`, Go 1.26.5 |
 | Layout rule | Packages named by SPEC §10 live at the **repo root** (`protocol/`, `lsp/`, `index/`, `daemon/`, `mcp/`). Everything else lives under **`internal/`**. `config/` is a grandfathered root exception (shipped in M0). |
-| Package count | 15 listed in §2.1: **4 shipped** (M0) + **11 to build** (M1–M4). `internal/deps` is deleted by M4, so v0.1 ships **14**. No package may be added without an amendment to this document. |
+| Package count | 16 listed in §2.1: **4 shipped** (M0) + **12 to build** (M1–M4). M3.5 adds the shared `internal/filelock` platform seam; `internal/deps` is deleted by M4, so v0.1 ships **15**. No package may be added without an amendment to this document. |
 | Import graph | Strictly layered, **acyclic** — proven in §2.3. |
 | Test-only packages | `internal/testutil` only. No `pkg/`, no `lsptest`, no `memindex`, no `fakelsp` binary. |
 
@@ -86,6 +87,7 @@ github.com/google/go-cmp              tests           (in use, M0)
 github.com/fsnotify/fsnotify          internal/watch  (M3)
 modernc.org/sqlite                    index           (M3)
 github.com/modelcontextprotocol/go-sdk mcp            (M4)
+golang.org/x/sys                     Windows APIs    (M3.5)
 ```
 
 Rejected, with the stdlib replacement each implementer must use instead:
@@ -126,6 +128,7 @@ edit `go.mod` or `go.sum`.
 | 13 | `internal/daemonctl/` | M2 | Client-side auto-start and dial (SPEC §3.1). Runs **in the MCP process**; deliberately cannot reach daemon state. |
 | 14 | `mcp/` | M4 (M5 extends) | The nine v0.1 tools over the MCP SDK: argument structs, SPEC §4.4 result envelopes, error-envelope discipline, session-ID mapping. |
 | 15 | `internal/testutil/` | M1 | Test-only: hermetic XDG env, fixture paths, integration-server locator with `t.Skip`, goroutine-leak assertion. No non-test package may import it. |
+| 16 | `internal/filelock/` | M3.5 | Cross-platform non-blocking advisory file locks shared by daemon liveness and client spawn coordination: `flock` on Unix, `LockFileEx` on Windows. |
 
 `testdata/` is not a Go package: it holds the TS and Python fixtures, their
 686-line README of measured expectations, and the M6 security tripwire.
@@ -150,12 +153,14 @@ graph TD
   daemonctl --> config
   daemonctl --> clock[internal/clock]
   daemonctl --> procx[internal/procx]
+  daemonctl --> filelock[internal/filelock]
 
   daemon --> protocol
   daemon --> config
   daemon --> clock
   daemon --> workspace[internal/workspace]
   daemon --> index
+  daemon --> filelock
 
   workspace --> protocol
   workspace --> config
@@ -180,6 +185,7 @@ graph TD
   wire --> protocol
   procx --> protocol
 
+  filelock[internal/filelock<br/>stdlib + x/sys/windows]
   clock[internal/clock<br/>stdlib only]
   protocol[protocol<br/>stdlib only]
 ```
@@ -201,7 +207,7 @@ number, no cycle can exist. **The graph is acyclic.**
 | Layer | Packages | May import |
 |---|---|---|
 | 0 | `protocol`, `internal/clock` | stdlib only |
-| 1 | `config`, `internal/procx`, `lsp/wire` | layer 0 |
+| 1 | `config`, `internal/procx`, `internal/filelock`, `lsp/wire` | layer 0 |
 | 2 | `lsp`, `index`, `internal/watch` | layers 0–1 |
 | 3 | `internal/workspace` | layers 0–2 |
 | 4 | `daemon`, `internal/daemonctl` | layers 0–3 |
@@ -1538,10 +1544,11 @@ expiring lease makes concurrent daemons harmless. Shutdown retains §6.5 order:
 watchers, index workers, language servers, checkpoint/conditional VACUUM, Store
 close.
 
-M6 adds the Windows implementation behind platform files: whole-process-tree
-teardown, secure local IPC and endpoint discovery/locking, and platform
-permission tests. The public `protocol.Service` and root-derived endpoint
-identity do not change. v0.1 is not permitted to become Unix-only.
+M3.5 adds the Windows implementation behind platform files: Job Object
+whole-process-tree teardown, AF_UNIX endpoint support, and `LockFileEx` locking.
+M6 hardens platform permissions and repeats process/transport security sign-off
+on Windows plus Unix. The public `protocol.Service` and root-derived endpoint
+identity do not change. v0.1 is not permitted to become single-OS.
 
 ### 5.9 `internal/daemonctl` (M2)
 
@@ -1848,14 +1855,16 @@ children inherit their own pipes — keep them separated.
 | **M1** | `internal/clock`, `internal/procx`, `lsp/wire`, `lsp`, `internal/testutil` | `config` (§4.1a), `protocol` (§4.1b), `testdata/README.md` (§1.8 note) | real-server integration tests for definition/references/hover/symbols/diagnostics on both fixtures; non-BMP UTF-16 test; crash+backoff test with a fake `Runner`; `procx.Resolve` exhaustive table test; import-rule test (rules 2 and 4) |
 | **M2** | `daemon`, `internal/daemonctl`, `internal/workspace` (live-query only) | `protocol` (§4.2–4.4), `cmd/langer` (`runDaemon`) | two concurrent clients on one daemon; killing a language server does not kill the daemon; idle sunset with the fake clock; version-mismatch drain-and-restart; **every SPEC §3.6 code exercised** |
 | **M3** | `index`, `internal/watch` | `lsp` + `lsp/wire` (internal selection range and disk-text serialization), `protocol` (failed index status), `internal/workspace` (watcher-first index-vs-live), `daemon` (Store/GC/activity wiring), `internal/deps` (drop sqlite + fsnotify), `cmd/langer` (import-rule test rules 1 and 3) | origin namespace + canonical-root fallback; collision-safe symbol keys; atomic complete reference replacement; watcher/scan race discard; structured failure; timed GC lease/retention; edit reflected without full re-index; restart survival |
+| **M3.5** | `internal/filelock`; Windows platform files in `internal/procx` | `config`, `daemon`, `internal/daemonctl`, `index`, `lsp/wire` | native Windows build/vet/unit/race/integration gates; process-tree cleanup; daemon auto-start and two-client AF_UNIX smoke |
 | **M4** | `mcp` | `cmd/langer` (`runMCP`, live `runStatus`), `internal/deps` (delete the package) | SPEC §11 navigation criteria end-to-end via MCP on both fixtures; exact nine-tool set asserted; no handler returns a Go error |
 | **M5** | — | `internal/workspace` (overlays, edit tokens), `mcp` (rename/apply/simulate), `daemon` (session lifecycle) | rename round-trip; `STALE_EDIT` after an out-of-band change; two sessions' overlays isolated; overlay diagnostics accurate with nothing written to disk |
-| **M6** | — | `daemon` + `internal/daemonctl` + `internal/procx` (permissions, Windows process/transport support, hardening), `index` | tripwire; Unix 0600 checks; secure Windows endpoint/locks; process-tree cleanup; Linux + Windows full SPEC §11 sign-off |
+| **M6** | — | `daemon` + `internal/daemonctl` + `internal/procx` (permissions and cross-platform hardening), `index` | tripwire; platform permission checks; process-tree cleanup revalidation; Windows + Unix full SPEC §11 sign-off |
 
-M3 through M5 run every build, vet, unit, race, and integration gate in the
-pinned Go 1.26.5 Linux Docker environment. M6 keeps that gate and adds a real
-Windows build/test gate; cross-compilation alone does not prove local IPC or
-process-tree cleanup.
+M3.5 through M5 run every build, vet, unit, race, and integration gate natively
+on the primary development host (currently Windows 11 with Go 1.26.5). Linux
+Docker is optional during those milestones. M6 performs final Windows plus at
+least one Unix build/test sign-off; cross-compilation alone does not prove local
+IPC or process-tree cleanup.
 
 **M1 must write `procx.Resolve`'s workspace-tree rejection with its own unit
 test, five milestones before M6's tripwire.** Otherwise five milestones of
@@ -1962,6 +1971,32 @@ cmd/langer/archrules_test.go         (append rules 1 and 3)
 internal/deps/deps.go                (delete 2 lines)
 ```
 
+### M3.5
+
+```
+internal/filelock/filelock.go         internal/filelock/filelock_test.go
+internal/filelock/filelock_unix.go    internal/filelock/filelock_windows.go
+internal/procx/run.go
+internal/procx/run_unix.go            internal/procx/run_unix_test.go
+internal/procx/run_windows.go         internal/procx/run_windows_test.go
+daemon/lock.go                        daemon/lock_test.go
+daemon/server.go                      daemon/server_test.go
+internal/daemonctl/connect.go         internal/daemonctl/connect_test.go
+config/config_test.go
+config/paths.go                       config/paths_test.go
+index/sqlite.go                       index/store_test.go
+lsp/wire/normalize.go                lsp/wire/normalize_test.go
+cmd/langer/main.go                    (signal portability ONLY)
+docs/ARCHITECTURE.md                  (this amendment)
+PLAN.md                               (M3.5 status/verification ONLY)
+```
+
+AF_UNIX remains the one M3.5 local transport on modern Windows and Unix unless
+native testing proves it unreliable. Named pipes require a further contract
+amendment; they must not introduce a second codec. Windows process supervision
+uses a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; Windows file locks
+use `LockFileEx`. Both use the already-pinned `golang.org/x/sys` module.
+
 ### M4
 
 ```
@@ -1994,16 +2029,12 @@ daemon/security_test.go              (tripwire, //go:build integration)
 daemon/perms.go                      daemon/perms_test.go
 daemon/server.go                     daemon/server_test.go
 daemon/lock.go                       daemon/lock_test.go
-daemon/transport_unix.go             daemon/transport_windows.go
+daemon/transport_unix.go             daemon/transport_windows.go  (only if M3.5 AF_UNIX needs parity work)
 index/perms_test.go
 internal/daemonctl/client.go          internal/daemonctl/client_test.go
-internal/daemonctl/connect.go         internal/daemonctl/connect_test.go
-internal/daemonctl/transport_unix.go  internal/daemonctl/transport_windows.go
-internal/procx/run.go                 internal/procx/run_test.go
-internal/procx/run_unix.go            internal/procx/run_windows.go
-internal/procx/run_windows_test.go
-internal/procx/security_test.go       (tripwire/process tree)
-config/paths.go                      config/paths_test.go
+internal/daemonctl/transport_unix.go  internal/daemonctl/transport_windows.go  (only if M3.5 AF_UNIX needs parity work)
+internal/procx/security_test.go       (tripwire/process-tree sign-off)
+config/paths.go                       config/paths_test.go
 PLAN.md                              ("v0.1 verification" section ONLY)
 ```
 
@@ -2245,10 +2276,10 @@ triggers lazy reindex healing. These values are constants driven by the
 injected clock, not wall-time sleeps in tests.
 
 **10.18 Is v0.1 Unix-only?**
-**Owner-approved winner: no.** M3–M5 use pinned Linux Docker while the existing
-Unix-only process/transport code remains. M6 must add Windows process-tree and
-secure local-transport support and run real Windows tests; a cross-compile or a
-Unix-only release declaration does not meet SPEC §11.
+**Owner-approved winner: no.** M3.5 makes Windows the primary native development
+gate and adds process-tree, file-lock, path, and local-AF_UNIX support before
+M4. M6 retains final Windows plus Unix parity/security sign-off; a cross-compile
+or a single-OS release declaration does not meet SPEC §11.
 
 ---
 

@@ -85,23 +85,63 @@ func lookPath(command, root string) (string, bool) {
 		if contains(root, canonicalDir) {
 			continue
 		}
-		candidate := filepath.Join(dir, command)
-		if !executable(candidate) {
-			continue
+		for _, name := range executableNames(command) {
+			candidate := filepath.Join(dir, name)
+			if !executable(candidate) {
+				continue
+			}
+			return canonical(candidate), true
 		}
-		return canonical(candidate), true
 	}
 	return "", false
 }
 
-// executable reports whether path is a regular file with an execute bit.
-// It follows symlinks, and it never runs anything.
+// executable reports whether path is a regular executable file. Unix uses
+// mode bits; Windows uses PATHEXT, matching normal command lookup there. It
+// follows symlinks and never runs anything.
 func executable(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || !info.Mode().IsRegular() {
 		return false
 	}
+	if runtime.GOOS == "windows" {
+		ext := strings.ToLower(filepath.Ext(path))
+		for _, allowed := range windowsExecutableExtensions() {
+			if ext == allowed {
+				return true
+			}
+		}
+		return false
+	}
 	return info.Mode().Perm()&0o111 != 0
+}
+
+func executableNames(command string) []string {
+	if runtime.GOOS != "windows" || filepath.Ext(command) != "" {
+		return []string{command}
+	}
+	exts := windowsExecutableExtensions()
+	out := make([]string, 0, len(exts))
+	for _, ext := range exts {
+		out = append(out, command+ext)
+	}
+	return out
+}
+
+func windowsExecutableExtensions() []string {
+	raw := os.Getenv("PATHEXT")
+	if raw == "" {
+		raw = ".COM;.EXE;.BAT;.CMD"
+	}
+	parts := strings.Split(raw, ";")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // canonical returns path with symlinks evaluated where possible, absolute and

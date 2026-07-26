@@ -44,8 +44,8 @@
 | M1 — LSP client wrapper | **done** | `a400e7c` |
 | M2 — daemon process | **done**, reviewed + fixed | `da65ee8` + fixes |
 | M3 — SQLite index | **done**, reviewed + race-hardened | `49fc074` |
-| M3.5 — Windows host gate (process + local IPC) | **next** | |
-| M4 — MCP frontend | not started | |
+| M3.5 — Windows host gate (process + local IPC) | **done** | this commit |
+| M4 — MCP frontend | **next** | |
 | M5 — edits & speculative overlays | not started | |
 | M6 — security, dual-platform sign-off | not started | |
 
@@ -54,6 +54,15 @@ runtime (gofmt, build, vet plain + integration, unit, race, integration against
 typescript-language-server 5.3.0 and pyright 1.1.411). That gate remains a
 valid historical bar for the code on `main`; it is **no longer the required
 daily workflow**. After M3.5, the primary gate is **native Windows**.
+
+M3.5 landed the native Windows gate: Job Object process-tree supervision,
+`LockFileEx` daemon/spawn coordination, AF_UNIX daemon IPC, Windows-safe SQLite
+and LSP file URIs, PATHEXT-aware executable resolution, and recursive watcher
+filtering for `ReadDirectoryChangesW`. Native Windows Go 1.26.5 passed build,
+plain + integration vet, unit, race, and real-server integration gates. An
+actual built `langer.exe` was auto-started concurrently by two clients and both
+reached the same daemon/workspace. Optional Linux Docker build, vet, unit, and
+race gates also passed.
 
 M0–M2 were each adversarially reviewed after implementation. That found real
 defects the passing test suite did not, and the pattern is worth keeping: in

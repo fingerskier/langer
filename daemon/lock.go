@@ -7,10 +7,10 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/internal/filelock"
 	"github.com/fingerskier/langer/protocol"
 )
 
@@ -52,16 +52,16 @@ const (
 	// all until an agent happens to retry. This bound comfortably covers that
 	// teardown, which is itself bounded by the constants in server.go.
 	DefaultLivenessLockWait = 25 * time.Second
-	// livenessLockPoll is the interval between attempts. A blocking flock
+	// livenessLockPoll is the interval between attempts. A blocking OS lock
 	// cannot be interrupted by a context, and a shutdown that cannot be
 	// interrupted is how a daemon becomes unkillable, so this polls instead.
 	livenessLockPoll = 25 * time.Millisecond
 )
 
-// livenessLock is an exclusive flock held for a daemon's whole lifetime. It —
-// not the presence of a socket file — is what "a daemon is running for this
-// workspace" means. A killed daemon leaves its socket behind but cannot leave
-// its lock behind: the kernel drops the flock when the process dies.
+// livenessLock is an exclusive OS file lock held for a daemon's whole
+// lifetime. It — not the presence of a socket file — is what "a daemon is
+// running for this workspace" means. A killed daemon leaves its socket behind
+// but cannot leave its lock behind: the OS drops it when the process dies.
 type livenessLock struct {
 	path string
 	file *os.File
@@ -99,17 +99,17 @@ func acquireLiveness(ctx context.Context, path string, wait time.Duration) (*liv
 	return &livenessLock{path: path, file: file}, nil
 }
 
-// flockWait polls for an exclusive, non-blocking flock until it wins, the
+// flockWait polls for an exclusive, non-blocking file lock until it wins, the
 // context is done, or the deadline passes.
 func flockWait(ctx context.Context, file *os.File, wait time.Duration) error {
 	path := file.Name()
 	deadline := time.Now().Add(wait)
 	for {
-		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := filelock.Try(file)
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !errors.Is(err, filelock.ErrContended) {
 			return protocol.NewErrorf(protocol.ErrInternal, "locking %s: %v", path, err)
 		}
 		// Checked AFTER the attempt above, so a wait of zero still means one
@@ -139,7 +139,7 @@ func (l *livenessLock) release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
-	err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	err := filelock.Unlock(l.file)
 	closeErr := l.file.Close()
 	l.file = nil
 	if err != nil {

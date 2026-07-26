@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -196,8 +197,10 @@ func TestLivenessLockIsUserOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("lock mode = %o, want 600", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("lock mode = %o, want 600", perm)
+		}
 	}
 }
 
@@ -218,8 +221,10 @@ func TestListenUnixReplacesAStaleSocketAndSecuresTheNewOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("socket mode = %o, want 600 (SPEC §9)", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("socket mode = %o, want 600 (SPEC §9)", perm)
+		}
 	}
 	if info.Mode()&os.ModeSocket == 0 {
 		t.Error("the stale regular file was not replaced by a socket")

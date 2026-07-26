@@ -8,11 +8,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/internal/clock"
+	"github.com/fingerskier/langer/internal/filelock"
 	"github.com/fingerskier/langer/internal/procx"
 	"github.com/fingerskier/langer/protocol"
 )
@@ -263,8 +263,8 @@ type spawnLock struct{ file *os.File }
 // acquireSpawnLock blocks — with a bound — until it owns the spawn attempt for
 // this workspace.
 //
-// It polls a non-blocking flock rather than using a blocking one so the wait
-// stays cancellable: a blocking flock cannot be interrupted by a context, and a
+// It polls a non-blocking OS file lock rather than using a blocking one so the
+// wait stays cancellable: a blocking lock cannot be interrupted by a context, and a
 // wedged spawn elsewhere would hang this process forever.
 func acquireSpawnLock(ctx context.Context, path string, ck clock.Clock) (*spawnLock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -278,11 +278,11 @@ func acquireSpawnLock(ctx context.Context, path string, ck clock.Clock) (*spawnL
 
 	deadline := time.Now().Add(spawnLockWait)
 	for {
-		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := filelock.Try(file)
 		if err == nil {
 			return &spawnLock{file: file}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !errors.Is(err, filelock.ErrContended) {
 			_ = file.Close()
 			return nil, protocol.NewErrorf(protocol.ErrInternal, "locking %s: %v", path, err)
 		}
@@ -306,7 +306,7 @@ func (l *spawnLock) release() {
 	if l == nil || l.file == nil {
 		return
 	}
-	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	_ = filelock.Unlock(l.file)
 	_ = l.file.Close()
 	l.file = nil
 }

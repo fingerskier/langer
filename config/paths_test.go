@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,9 @@ func TestSocketPathLengthIsRefusedNotTruncated(t *testing.T) {
 
 // TestEnsureRuntimeDirIsUserOnly is the SPEC §9 permission requirement.
 func TestEnsureRuntimeDirIsUserOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports synthetic mode bits; ACL verification is an M6 gate")
+	}
 	cfg := testConfig(t)
 
 	// A pre-existing, world-readable directory must be tightened, not accepted:

@@ -816,7 +816,7 @@ func replaceTestReferences(
 func testFileRecord(namespace, path, name string) FileRecord {
 	return FileRecord{
 		Path:         path,
-		AbsolutePath: filepath.Join("/workspace", filepath.FromSlash(path)),
+		AbsolutePath: filepath.Join(os.TempDir(), "langer-index-workspace", filepath.FromSlash(path)),
 		LanguageID:   "go",
 		ContentHash:  hashByte('a'),
 		SizeBytes:    128,
@@ -858,8 +858,10 @@ func assertPrivateFile(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("%s mode = %04o, want 0600", path, got)
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s mode = %04o, want 0600", path, got)
+		}
 	}
 }
 

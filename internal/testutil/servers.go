@@ -3,6 +3,7 @@ package testutil
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/fingerskier/langer/config"
@@ -46,7 +47,7 @@ func RequireLanguageServer(t *testing.T, name string) config.LanguageServer {
 
 	switch name {
 	case "typescript":
-		command := filepath.Join(bin, "typescript-language-server")
+		command := platformCommand(filepath.Join(bin, "typescript-language-server"))
 		requireFile(t, command, name)
 
 		// typescript-language-server 5.3.0 cannot start without an explicit
@@ -66,7 +67,7 @@ func RequireLanguageServer(t *testing.T, name string) config.LanguageServer {
 		}
 
 	case "python":
-		command := filepath.Join(bin, "pyright-langserver")
+		command := platformCommand(filepath.Join(bin, "pyright-langserver"))
 		requireFile(t, command, name)
 
 		return config.LanguageServer{
@@ -81,6 +82,13 @@ func RequireLanguageServer(t *testing.T, name string) config.LanguageServer {
 		t.Fatalf("testutil: no integration server registered under %q", name)
 		return config.LanguageServer{}
 	}
+}
+
+func platformCommand(path string) string {
+	if runtime.GOOS == "windows" {
+		return path + ".cmd"
+	}
+	return path
 }
 
 func requireFile(t *testing.T, path, server string) {

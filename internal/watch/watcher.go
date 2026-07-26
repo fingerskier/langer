@@ -227,6 +227,14 @@ func (w *watcher) consume(
 	if isControlEvent(eventPath, controls) {
 		return true, nil
 	}
+	// ReadDirectoryChangesW reports a root watch recursively on Windows. Keep
+	// the watcher contract platform-neutral by accepting nested events only
+	// when their immediate directory is still in the authoritative watch set.
+	// Events for a newly created direct child still pass because their parent
+	// is the watched root and can trigger scope reconciliation.
+	if _, parentWatched := watched[filepath.Dir(eventPath)]; !parentWatched {
+		return false, nil
+	}
 
 	rel, err := filepath.Rel(w.root, eventPath)
 	if err != nil {

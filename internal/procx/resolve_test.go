@@ -15,6 +15,9 @@ import (
 // writeExe creates an executable file and returns its path.
 func writeExe(t *testing.T, dir, name string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		name += ".exe"
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -127,10 +130,10 @@ func TestResolveWorkspaceRootItselfIsInside(t *testing.T) {
 func TestResolveSymlinkIntoWorkspaceIsRejected(t *testing.T) {
 	tmp := t.TempDir()
 	root := filepath.Join(tmp, "repo")
-	writeExe(t, filepath.Join(root, "node_modules", ".bin"), "server")
+	target := writeExe(t, filepath.Join(root, "node_modules", ".bin"), "server")
 
-	link := filepath.Join(tmp, "innocent-looking-server")
-	if err := os.Symlink(filepath.Join(root, "node_modules", ".bin", "server"), link); err != nil {
+	link := filepath.Join(tmp, "innocent-looking-server"+filepath.Ext(target))
+	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
 

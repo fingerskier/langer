@@ -100,7 +100,14 @@ func Open(ctx context.Context, databasePath string, ck clock.Clock) (Store, erro
 }
 
 func sqliteDSN(path string, immediate bool) string {
-	dsn := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	slashPath := filepath.ToSlash(path)
+	// url.URL treats "C:" before the first slash as an authority unless a
+	// Windows drive path is rooted explicitly. SQLite rejects that authority;
+	// file:///C:/... is the portable URI form it accepts.
+	if filepath.VolumeName(path) != "" && !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	dsn := url.URL{Scheme: "file", Path: slashPath}
 	query := url.Values{}
 	// busy_timeout must be installed before journal_mode: the latter can need
 	// the schema lock while another daemon is concurrently opening/migrating.

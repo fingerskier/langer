@@ -3,6 +3,7 @@ package wire
 import (
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/fingerskier/langer/protocol"
@@ -276,10 +277,19 @@ func uriToAbs(uri string) (string, bool) {
 		return "", false
 	}
 	path := parsed.Path
+	if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+		// Preserve UNC authorities as //server/share on Windows.
+		path = "//" + parsed.Host + path
+	}
 	if path == "" {
 		return "", false
 	}
-	return filepath.Clean(path), true
+	if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		// file:///C:/repo is the canonical drive-letter URI; filepath expects
+		// C:/repo rather than /C:/repo on Windows.
+		path = path[1:]
+	}
+	return filepath.Clean(filepath.FromSlash(path)), true
 }
 
 func relativeTo(root, abs string) (string, bool) {
@@ -296,6 +306,12 @@ func relativeTo(root, abs string) (string, bool) {
 // PathToURI converts a workspace-relative slash path to a file:// URI.
 func PathToURI(root, rel string) string {
 	abs := filepath.Join(root, filepath.FromSlash(rel))
-	u := url.URL{Scheme: "file", Path: abs}
+	path := filepath.ToSlash(abs)
+	if filepath.VolumeName(abs) != "" && !strings.HasPrefix(path, "/") {
+		// A drive-letter path must be rooted in the URI path or net/url emits
+		// file://C:/..., incorrectly treating C: as an authority.
+		path = "/" + path
+	}
+	u := url.URL{Scheme: "file", Path: path}
 	return u.String()
 }

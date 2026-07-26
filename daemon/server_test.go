@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/fingerskier/langer/internal/daemonctl"
 	"github.com/fingerskier/langer/internal/procx"
 	"github.com/fingerskier/langer/internal/testutil"
+	"github.com/fingerskier/langer/lsp/wire"
 	"github.com/fingerskier/langer/protocol"
 )
 
@@ -162,7 +164,7 @@ func testContext(t *testing.T) context.Context {
 // concurrently".
 func TestTwoConcurrentClientsShareOneDaemon(t *testing.T) {
 	h := startDaemon(t, nil, func(root string, _ int, s *fakeSession) {
-		s.locations = `[{"uri":"file://` + root + `/src/user.ts",` +
+		s.locations = `[{"uri":"` + wire.PathToURI(root, "src/user.ts") + `",` +
 			`"range":{"start":{"line":0,"character":17},"end":{"line":0,"character":21}}}]`
 	})
 
@@ -918,6 +920,9 @@ func TestDrainRefusesNewWork(t *testing.T) {
 // TestSocketAndLocksAreUserOnly is SPEC §9's "database and socket files should
 // have restrictive permissions (user-only)".
 func TestSocketAndLocksAreUserOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows endpoint ACL verification is an M6 gate")
+	}
 	h := startDaemon(t, nil, nil)
 
 	dir, err := os.Stat(h.cfg.RuntimeDir())

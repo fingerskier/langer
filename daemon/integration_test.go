@@ -5,8 +5,13 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +32,157 @@ import (
 //
 // Every expected value below is quoted from testdata/README.md, which was
 // measured against the real server rather than guessed.
+
+func TestActualBinaryAutoStartsOnceForTwoConcurrentClients(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	repoRoot, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeName := "langer"
+	if runtime.GOOS == "windows" {
+		exeName += ".exe"
+	}
+	exe := filepath.Join(t.TempDir(), exeName)
+	goExe := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if runtime.GOOS == "windows" {
+		goExe += ".exe"
+	}
+	if _, err := procx.NewRunner().Output(ctx, procx.Spec{
+		Path: goExe,
+		Args: []string{"build", "-o", exe, "./cmd/langer"},
+		Dir:  repoRoot,
+		Env:  os.Environ(),
+	}); err != nil {
+		t.Fatalf("building the actual langer binary: %v", err)
+	}
+
+	state := shortTempDir(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(state, "config.toml")
+	databasePath := filepath.Join(state, "index.db")
+	socketPath := filepath.Join(state, "daemon.sock")
+	configText := fmt.Sprintf("database_path = %s\nsocket_path = %s\nlog_level = %q\n",
+		strconv.Quote(databasePath), strconv.Quote(socketPath), "error")
+	if err := os.WriteFile(configPath, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.EnvConfigPath, configPath)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := cfg.WorkspaceSocketPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The actual daemon deliberately idles for 30 minutes. Capture its PID via
+	// the public handshake and stop it before any TempDir cleanup tries to
+	// remove the running executable.
+	daemonPID := 0
+	t.Cleanup(func() {
+		if daemonPID == 0 {
+			daemonPID, _ = handshakePID(socket)
+		}
+		if daemonPID <= 0 {
+			return
+		}
+		if process, err := os.FindProcess(daemonPID); err == nil {
+			_ = process.Kill()
+			_, _ = process.Wait()
+		}
+	})
+
+	type connected struct {
+		client *daemonctl.Client
+		ws     protocol.WorkspaceID
+		err    error
+	}
+	results := make(chan connected, 2)
+	for _, session := range []protocol.SessionID{"m3.5-smoke-a", "m3.5-smoke-b"} {
+		go func(session protocol.SessionID) {
+			client, err := daemonctl.Connect(ctx, cfg, root, clock.New(), procx.NewRunner(), daemonctl.Options{
+				Executable: exe,
+				Session:    session,
+			})
+			if err != nil {
+				results <- connected{err: err}
+				return
+			}
+			opened, err := client.OpenWorkspace(ctx, protocol.OpenWorkspaceParams{Session: session, Root: root})
+			results <- connected{client: client, ws: opened.Workspace, err: err}
+		}(session)
+	}
+
+	var got [2]connected
+	for i := range got {
+		got[i] = <-results
+		if got[i].err != nil {
+			t.Fatalf("client %d: %v", i, got[i].err)
+		}
+	}
+	daemonPID, err = handshakePID(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ws == "" || got[0].ws != got[1].ws {
+		t.Fatalf("workspace ids = %q and %q", got[0].ws, got[1].ws)
+	}
+	for i := range got {
+		_ = got[i].client.Close()
+	}
+
+	process, err := os.FindProcess(daemonPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Kill(); err != nil {
+		t.Fatalf("stopping actual daemon %d: %v", daemonPID, err)
+	}
+	if _, err := process.Wait(); err != nil {
+		t.Fatalf("waiting for actual daemon %d: %v", daemonPID, err)
+	}
+	daemonPID = 0
+}
+
+func handshakePID(socket string) (int, error) {
+	conn, err := net.DialTimeout("unix", socket, 2*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return 0, err
+	}
+	params, err := json.Marshal(protocol.HandshakeParams{Session: "m3.5-smoke", ClientVersion: protocol.Version})
+	if err != nil {
+		return 0, err
+	}
+	codec := protocol.NewCodec(conn)
+	if err := codec.WriteRequest(protocol.NewRequest(1, protocol.MethodHandshake, params)); err != nil {
+		return 0, err
+	}
+	response, err := codec.ReadResponse()
+	if err != nil {
+		return 0, err
+	}
+	if response.Error != nil {
+		return 0, response.Error
+	}
+	var result protocol.HandshakeResult
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		return 0, err
+	}
+	if result.PID <= 0 {
+		return 0, fmt.Errorf("handshake returned invalid PID %d", result.PID)
+	}
+	return result.PID, nil
+}
 
 // recordingRunner wraps the production runner and keeps the process handles, so
 // a test can kill a REAL language server's process group.

@@ -8,14 +8,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/internal/clock"
+	"github.com/fingerskier/langer/internal/filelock"
 	"github.com/fingerskier/langer/internal/procx"
 	"github.com/fingerskier/langer/protocol"
 )
@@ -101,7 +102,7 @@ func (h *heldLock) release() {
 		return
 	}
 	h.once.Do(func() {
-		_ = syscall.Flock(int(h.file.Fd()), syscall.LOCK_UN)
+		_ = filelock.Unlock(h.file)
 		_ = h.file.Close()
 	})
 }
@@ -116,7 +117,7 @@ func takeLivenessLock(t *testing.T, cfg *config.Config, root string) *heldLock {
 	if err != nil {
 		t.Fatalf("opening the liveness lock %s: %v", path, err)
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := filelock.Try(file); err != nil {
 		_ = file.Close()
 		t.Fatalf("locking %s: %v", path, err)
 	}
@@ -243,12 +244,12 @@ func (r *spawningRunner) waitForLiveness() error {
 	held := &heldLock{file: file}
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := filelock.Try(file)
 		if err == nil {
 			held.release()
 			return nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) || !time.Now().Before(deadline) {
+		if !errors.Is(err, filelock.ErrContended) || !time.Now().Before(deadline) {
 			_ = file.Close()
 			return err
 		}
@@ -565,7 +566,9 @@ func TestSpawnLockSerialisesSpawnAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("spawn lock mode = %o, want 600 (SPEC §9)", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("spawn lock mode = %o, want 600 (SPEC §9)", perm)
+		}
 	}
 }

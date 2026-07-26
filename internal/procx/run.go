@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 
 	"github.com/fingerskier/langer/protocol"
 )
@@ -82,28 +81,40 @@ func (runner) Start(ctx context.Context, spec Spec) (Process, error) {
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	cmd.SysProcAttr = sysProcAttr(spec.Detached)
+	configureCommand(cmd, spec.Detached)
 
 	if err := cmd.Start(); err != nil {
 		closeAll(stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW)
 		return nil, protocol.NewErrorf(protocol.ErrInternal, "starting %s: %v", spec.Path, err)
 	}
+	controller, err := newProcessController(cmd.Process, spec.Detached)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		closeAll(stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW)
+		return nil, protocol.NewErrorf(protocol.ErrInternal, "supervising %s: %v", spec.Path, err)
+	}
+
 	// The child holds its own descriptors now. Dropping ours is what makes the
 	// reader see EOF when the child exits.
 	closeAll(stdinR, stdoutW, stderrW)
 
 	p := &process{
-		cmd:    cmd,
-		stdin:  stdinW,
-		stdout: stdoutR,
-		stderr: stderrR,
-		done:   make(chan struct{}),
+		cmd:        cmd,
+		controller: controller,
+		stdin:      stdinW,
+		stdout:     stdoutR,
+		stderr:     stderrR,
+		done:       make(chan struct{}),
 	}
 
 	// One goroutine owns Wait; every caller of p.Wait reads its result. A second
 	// goroutine turns context cancellation into a process-group kill.
 	go func() {
 		p.waitErr = cmd.Wait()
+		if err := p.controller.Close(); p.waitErr == nil && err != nil {
+			p.waitErr = err
+		}
 		close(p.done)
 	}()
 	go func() {
@@ -122,22 +133,39 @@ func (r runner) Output(ctx context.Context, spec Spec) ([]byte, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
+	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
 	cmd.Env = spec.Env
-	cmd.SysProcAttr = sysProcAttr(spec.Detached)
+	configureCommand(cmd, spec.Detached)
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = io.Discard
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return killGroup(cmd.Process.Pid)
+	if err := cmd.Start(); err != nil {
+		return stdout.Bytes(), protocol.NewErrorf(protocol.ErrInternal, "starting %s: %v", spec.Path, err)
+	}
+	controller, err := newProcessController(cmd.Process, spec.Detached)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return stdout.Bytes(), protocol.NewErrorf(protocol.ErrInternal, "supervising %s: %v", spec.Path, err)
 	}
 
-	if err := cmd.Run(); err != nil {
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	select {
+	case err = <-wait:
+	case <-ctx.Done():
+		_ = controller.Kill()
+		err = <-wait
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
+	if closeErr := controller.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
 		return stdout.Bytes(), protocol.NewErrorf(protocol.ErrInternal, "running %s: %v", spec.Path, err)
 	}
 	return stdout.Bytes(), nil
@@ -151,19 +179,17 @@ func checkSpec(spec Spec) error {
 	return nil
 }
 
-func sysProcAttr(detached bool) *syscall.SysProcAttr {
-	if detached {
-		// A new session implies a new process group led by the child.
-		return &syscall.SysProcAttr{Setsid: true}
-	}
-	return &syscall.SysProcAttr{Setpgid: true}
+type processController interface {
+	Kill() error
+	Close() error
 }
 
 type process struct {
-	cmd    *exec.Cmd
-	stdin  *os.File
-	stdout *os.File
-	stderr *os.File
+	cmd        *exec.Cmd
+	controller processController
+	stdin      *os.File
+	stdout     *os.File
+	stderr     *os.File
 
 	done    chan struct{}
 	waitErr error
@@ -191,30 +217,8 @@ func (p *process) Kill() error {
 		return nil // already exited; killing again is a no-op, not an error
 	default:
 	}
-	p.killOnce.Do(func() { p.killErr = killGroup(p.cmd.Process.Pid) })
+	p.killOnce.Do(func() { p.killErr = p.controller.Kill() })
 	return p.killErr
-}
-
-// killGroup signals the whole process group. Both Setpgid and Setsid make the
-// child its own group leader, so the group id equals its pid.
-func killGroup(pid int) error {
-	if pid <= 0 {
-		return nil
-	}
-	err := syscall.Kill(-pid, syscall.SIGKILL)
-	switch err {
-	case nil, syscall.ESRCH:
-		return nil
-	case syscall.EPERM:
-		// The group is gone and the pid was recycled into a group we do not
-		// own; killing the pid directly is the safe fallback.
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			return protocol.NewErrorf(protocol.ErrInternal, "killing pid %d: %v", pid, err)
-		}
-		return nil
-	default:
-		return protocol.NewErrorf(protocol.ErrInternal, "killing process group %d: %v", pid, err)
-	}
 }
 
 func closeAll(files ...*os.File) {
