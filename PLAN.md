@@ -26,10 +26,13 @@
    never be weakened to pass.
 6. Errors are structured per SPEC §3.6 everywhere — no free-text error strings
    across IPC or MCP boundaries.
-7. **Platform gate.** Through M5, run every build/vet/test gate in the pinned
-   Go 1.26.5 Linux Docker environment while the pre-existing Windows port is
-   incomplete. M6 must add Windows process and local-IPC support, then run the
-   full gate on both Linux and Windows; v0.1 may not be declared Unix-only.
+7. **Platform gate (revised 2026-07-26).** **Primary development and milestone
+   gates run natively on the implementer's host OS** (currently Windows 11 +
+   local Go 1.26.x). Do **not** require Linux Docker for day-to-day M4–M5 work.
+   M3.5 unblocks Windows so `go build` / `go test` / integration work there.
+   **Secondary platforms** (Linux, macOS) are verified at M6 for v0.1 sign-off
+   (CI or a real host — not a mandatory Docker loop on every commit). v0.1 may
+   not be declared single-OS unless SPEC §11 is explicitly amended.
 
 ---
 
@@ -40,19 +43,17 @@
 | M0 — scaffold, CLI, config, fixtures | **done** | `2d07acb` |
 | M1 — LSP client wrapper | **done** | `a400e7c` |
 | M2 — daemon process | **done**, reviewed + fixed | `da65ee8` + fixes |
-| M3 — SQLite index | **done**, reviewed + race-hardened | `(this commit)` |
+| M3 — SQLite index | **done**, reviewed + race-hardened | `49fc074` |
+| M3.5 — Windows host gate (process + local IPC) | **next** | |
 | M4 — MCP frontend | not started | |
 | M5 — edits & speculative overlays | not started | |
-| M6 — security, Windows, v0.1 sign-off | not started | |
+| M6 — security, dual-platform sign-off | not started | |
 
-Verification gates are green through M3 in the pinned Go 1.26.5 Linux Docker
-runtime: changed-file `gofmt`, `go build`, `go vet` (plain and
-`-tags=integration`), `go test ./...`, `go test ./... -race`, and
-`go test -tags=integration ./...` driving the real typescript-language-server
-5.3.0 and pyright 1.1.411. The M3 race gate found and fixed a supervisor
-shutdown race: restart/process workers now reserve their wait-group slots under
-the same lifecycle lock that begins shutdown, so no worker can be added after
-shutdown starts waiting.
+M0–M3 verification was completed in the pinned Go 1.26.5 **Linux Docker**
+runtime (gofmt, build, vet plain + integration, unit, race, integration against
+typescript-language-server 5.3.0 and pyright 1.1.411). That gate remains a
+valid historical bar for the code on `main`; it is **no longer the required
+daily workflow**. After M3.5, the primary gate is **native Windows**.
 
 M0–M2 were each adversarially reviewed after implementation. That found real
 defects the passing test suite did not, and the pattern is worth keeping: in
@@ -62,6 +63,34 @@ returning an empty list while the server was still indexing (indistinguishable
 from "no such symbol"); a references query racing project load and returning
 only the declaration; speculative diagnostics surviving a `simulate_edit` and
 being reported against a clean file.
+
+### Post-M3 vector review (2026-07-26)
+
+Architecture is **on vector** for the end-goal: DB-backed, per-project LSP
+service for coding agents, exposed over MCP. Right split already exists —
+daemon owns language servers + SQLite; MCP will be a thin `protocol.Service`
+client (`daemon.Core` in-process / `daemonctl.Client` over local IPC). Do not
+invert that in M4.
+
+**What is solid after M3**
+
+- Per-workspace daemon, single-instance locks, idle sunset, drain-and-restart.
+- SQLite WAL index, workspace-scoped `symbol_key`, atomic per-file + reference
+  sets, watcher-before-scan, hash recheck before commit, GC lease/retention.
+- Correctness bias: `NOT_READY` / live fallback over partial workspace answers.
+
+**Open risks to carry (not architecture drift)**
+
+- Product value is still gated on **M4** (no `mcp/` package yet).
+- Live fallback for references during indexing can still yield **partial**
+  answers agents cannot distinguish from "few call sites" (M2 class; index
+  warm path is safer). Prefer explicit `NOT_READY` when `index_state` is
+  incomplete for completeness-sensitive tools; teach retry in MCP tool docs.
+- `get_definition` / `get_hover` remain live-only by design — agent wins from
+  index are mainly `workspace_symbols`, warm references, bulk diagnostics,
+  restart.
+- Multi-daemon → one SQLite file is fine for single-project multi-agent; write
+  broker only if contention is measured.
 
 ### Carried into later milestones
 
@@ -76,12 +105,52 @@ Known and deliberately deferred rather than forgotten:
   before M6 signs off on process hygiene.
 - **SPEC §3.1's "configurable idle period" is not configurable** — no config
   key, and `cmd/langer` never sets one. Needs a `config` key.
-- **Windows does not build yet.** `internal/procx/run.go` uses `Setsid`,
-  `Setpgid`, and `syscall.Kill` with no `_unix.go`/`_windows.go` split, and
-  the daemon transport is Unix-socket-only. The approved resolution is binding:
-  M3–M5 verify in Linux Docker; M6 adds Windows process-tree cleanup, a secure
-  local transport, and Windows build/test coverage. Declaring v0.1 Unix-only is
-  not an alternative.
+- **Windows did not build at M3.** `internal/procx` uses Unix `Setsid` /
+  `Setpgid` / process-group kill; `daemon` locking uses `syscall.Flock`;
+  local IPC is `net.Listen("unix", …)`. **M3.5** is the dedicated host gate
+  (below). Declaring v0.1 Unix-only is not an alternative without a SPEC
+  amendment.
+
+### Platform strategy (decision 2026-07-26)
+
+**Question:** Should Windows be primary now, with Linux/macOS only at a later
+cutoff, to avoid Docker thrash?
+
+**Decision: yes to Windows-primary development; no to "product first, ports
+last as a vague afterthought."**
+
+| Approach | Verdict |
+|---|---|
+| Keep Docker Linux as daily gate through M5 | **Reject.** Huge time cost for no product unlock; blocks dogfooding on the actual host. |
+| Ship M4–M5 only on Windows; never port Unix | **Reject** unless SPEC §11 is amended. Target users include Unix agents/CI. |
+| Full dual-platform polish before M4 | **Reject.** Over-scopes process-tree and permission parity before the MCP surface exists. |
+| **M3.5 host unblocking, then M4–M5 on Windows, dual-platform at M6** | **Adopt.** Smallest change that kills Docker as a daily requirement while keeping v0.1 honest. |
+
+**What M3.5 is (and is not)**
+
+- **Is:** build-tag split so Windows builds and runs the existing M0–M3 stack;
+  process spawn/kill for language servers and daemon auto-start; local IPC the
+  MCP client can dial; file locks that work on NTFS; primary test gate =
+  native Windows (unit + race + integration with real tsserver/pyright).
+- **Is not:** full M6 security hardening, dual-platform CI matrix, or claiming
+  Linux/macOS "done." Secondary OS smoke can wait for M6 (or opportunistic CI).
+
+**Implementation notes for M3.5**
+
+- Prefer **AF_UNIX on Windows** (supported on modern Windows + Go) if paths and
+  permissions stay simple and match existing socket layout; fall back to
+  **named pipes** only if AF_UNIX proves brittle in practice. Do not invent a
+  second request codec — same newline-delimited JSON RPC.
+- Split `internal/procx` into `*_unix.go` / `*_windows.go` (Job Object or
+  equivalent for process-tree kill on Windows).
+- Split lock implementation off Unix `Flock` (Windows file-lock or exclusive
+  create pattern with documented semantics).
+- Keep Linux Docker **optional and welcome** for opportunistic parity checks
+  along the way — never a required step for merging M4/M5. Suggested uses:
+  after M3.5 procx/lock/IPC splits (catch Unix regressions early), after a
+  large concurrency change, and once before M6 sign-off. Failures on optional
+  Linux runs are real bugs to fix, but they do not block a Windows-green
+  milestone commit unless the change intentionally touched Unix-only paths.
 
 ---
 
@@ -172,45 +241,78 @@ fallback; independent atomic reference replacement; watcher-before-scan and
 scan/edit race discard; staleness/invalidation; structured failed status; and
 fake-clock GC lease/renewal/retention. Integration tests prove an edit is
 reflected without full re-index and the index answers after daemon restart.
-The complete plain, race, vet, build, and integration gates pass in Linux
-Docker.
+The complete plain, race, vet, build, and integration gates passed in Linux
+Docker at M3 land time. After M3.5, re-prove those gates on **native Windows**.
+
+### M3.5 — Windows host gate (`procx`, locks, local IPC)
+
+**Do this before M4.** Goal: daily development and dogfooding on Windows
+without Docker, without waiting for full dual-platform polish.
+
+- Build-tag split for process supervision: Unix session/process-group kill vs
+  Windows Job Object (or documented equivalent) so language-server grandchildren
+  cannot leak on either OS.
+- Local IPC that works on Windows for daemon ↔ MCP: prefer AF_UNIX if
+  reliable on the target Windows build; otherwise named pipes. Same protocol
+  codec as M2 (`protocol` newline-delimited JSON).
+- Single-instance / spawn locks without Unix `Flock` on Windows.
+- Signal / graceful-shutdown path for `langer daemon` on Windows (Ctrl-C /
+  console close equivalent to SIGTERM handling).
+- Path and permission smoke: DB and endpoint files user-restricted where the
+  OS allows (full permission matrix can finish in M6).
+- Fix only what blocks build/test on Windows; do not rework index or MCP.
+
+**Accept:** on native Windows: `go build ./...`, `go vet ./...` (plain and
+`-tags=integration`), `go test ./...`, `go test ./... -race`, and
+`go test -tags=integration ./...` green against real typescript-language-server
+and pyright on the fixtures. Daemon auto-start + two concurrent clients still
+work. Optional: one Linux/macOS cross-compile or CI smoke if convenient — not
+required to close M3.5.
 
 ### M4 — MCP frontend (`mcp/`)
 
 - MCP server over stdio exposing exactly the nine ✅ tools (SPEC §4.2) with
   result shapes from SPEC §4.4; auto-starts the workspace daemon on demand.
 - `open_document` / `close_document` / `index_status` plumbing.
+- Tool descriptions must teach agents to **retry on `NOT_READY`** and never
+  treat empty lists as definitive while the index is incomplete.
+- Primary gate: **native Windows** (M3.5 must already be green).
 
 **Accept:** SPEC §11 navigation criteria pass end-to-end via MCP on both
-fixture projects; `claude mcp add langer -- langer mcp --stdio` works against
-a local checkout (manual verification note in the milestone commit).
+fixture projects; `claude mcp add langer -- langer mcp --stdio` (or equivalent
+host) works against a local Windows checkout (manual verification note in the
+milestone commit).
 
 ### M5 — Edits & speculative overlays
 
 - `rename_symbol` dry-run returning `edit_token` (content hashes of affected
   files); `apply_edit` verifying hashes, rejecting `STALE_EDIT` (SPEC §4.2).
+  Fold the existing `internal/workspace` apply path — do not write a second
+  implementation.
 - `simulate_edit`: per-session in-memory overlays, TTL, isolation between
   sessions, invalidation on real file change, never indexed (SPEC §4.2).
+- Primary gate remains native Windows.
 
 **Accept:** rename round-trip on fixtures; apply after out-of-band file change
 returns `STALE_EDIT`; two sessions' overlays are isolated; overlay diagnostics
 are accurate with nothing written to disk (SPEC §11).
 
-### M6 — Security test, hardening, v0.1 sign-off
+### M6 — Security test, dual-platform sign-off, v0.1
 
 - The tripwire test: open the TS fixture (whose `node_modules/.bin` contains
   an executable that writes a sentinel file if run) and assert the sentinel is
   never created.
-- Restrictive permissions on socket + DB (user-only).
-- Split process supervision into Unix and Windows implementations while
-  preserving whole-process-tree cleanup; add a secure Windows local transport
-  and endpoint/lock permissions; make `GOOS=windows go build ./...` and the
-  Windows unit/integration suite green.
+- Restrictive permissions on socket/pipe + DB (user-only) on each supported OS.
+- Finish process-tree and local-IPC **parity** on Linux and macOS (not a from-
+  scratch Windows port — that landed in M3.5). Prefer real hosts or CI over
+  mandatory local Docker for every check.
+- Fix weak `NoGoroutineLeaks`; add configurable idle sunset if still missing.
 - Run the full SPEC §11 checklist; record results in `PLAN.md` under a
   "v0.1 verification" heading.
 
 **Accept:** all §11 criteria checked off with test evidence; full suite green
-on Linux and Windows, including the tripwire and process-tree cleanup tests.
+on **Windows and at least one Unix (Linux or macOS)**, including the tripwire
+and process-tree cleanup tests.
 
 ---
 
