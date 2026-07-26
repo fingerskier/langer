@@ -1317,6 +1317,65 @@ func TestAConnectionAcceptedAfterShutdownBeganIsRefused(t *testing.T) {
 	}
 }
 
+// TestDisconnectCleanupIsBounded keeps a session cleanup deliberately stuck.
+// A vanished client must not keep its serve goroutine (and therefore daemon
+// shutdown's WaitGroup) alive forever while the actor that could unblock it is
+// itself waiting for shutdown.
+func TestDisconnectCleanupIsBounded(t *testing.T) {
+	fake := newFakeLSP(t, nil)
+	srv, err := NewServer(Options{
+		Root: fixtureRoot(t), Config: testConfig(t), Logger: testLogger(t),
+		IdleTimeout: time.Hour, Resolver: fake, Runner: fake,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.cancelReq()
+
+	srv.sessionCleanupTimeout = 20 * time.Millisecond
+	cleanupStarted := make(chan struct{})
+	var once sync.Once
+	srv.endSessionFn = func(ctx context.Context, _ protocol.EndSessionParams) (protocol.EmptyResult, error) {
+		once.Do(func() { close(cleanupStarted) })
+		<-ctx.Done()
+		return protocol.EmptyResult{}, ctx.Err()
+	}
+
+	serverConn, clientConn := net.Pipe()
+	serveDone := make(chan struct{})
+	srv.wg.Add(1)
+	go func() {
+		srv.serve(serverConn)
+		close(serveDone)
+	}()
+
+	codec := protocol.NewCodec(clientConn)
+	if err := codec.WriteRequest(protocol.NewRequest(1, protocol.MethodIndexStatus,
+		mustJSON(t, protocol.IndexStatusParams{
+			Session:   "disconnect-cleanup",
+			Workspace: "unknown-workspace",
+		}))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codec.ReadResponse(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-cleanupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect did not attempt session cleanup")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("bounded session cleanup did not release the serve goroutine")
+	}
+}
+
 // TestRunReturnsWhenClientsConnectDuringShutdown is the regression for a hang
 // that denies a whole workspace its daemon.
 //

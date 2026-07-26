@@ -31,10 +31,27 @@ func TestIndexStateSpellings(t *testing.T) {
 		protocol.IndexScanning: "scanning",
 		protocol.IndexIndexing: "indexing",
 		protocol.IndexReady:    "ready",
+		protocol.IndexFailed:   "failed",
 	} {
 		if string(state) != want {
 			t.Errorf("state = %q, want %q", state, want)
 		}
+	}
+}
+
+func TestIndexFailureStatusCarriesStructuredError(t *testing.T) {
+	t.Parallel()
+	got, err := json.Marshal(protocol.IndexStatusResult{
+		Root:  "/repo",
+		State: protocol.IndexFailed,
+		Error: protocol.NewError(protocol.ErrInternal, "index worker failed"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"root_path":"/repo","state":"failed","files_indexed":0,"files_total":0,"error":{"code":"INTERNAL","message":"index worker failed"}}`
+	if string(got) != want {
+		t.Fatalf("IndexStatusResult JSON =\n  %s\nwant\n  %s", got, want)
 	}
 }
 

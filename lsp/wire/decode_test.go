@@ -191,6 +191,9 @@ func TestDecodeSymbolsDocumentSymbolHierarchy(t *testing.T) {
 	if s.SelectionRange.Start.Character != 16 {
 		t.Fatalf("selectionRange = %+v", s.SelectionRange)
 	}
+	if !s.HasSelectionRange {
+		t.Fatal("DocumentSymbol's explicit selectionRange was not marked trustworthy")
+	}
 	if len(s.Children) != 1 || s.Children[0].Name != "id" {
 		t.Fatalf("children = %+v", s.Children)
 	}
@@ -224,6 +227,9 @@ func TestDecodeSymbolsSymbolInformationFlat(t *testing.T) {
 	// With no selectionRange, the identifier range is the whole range.
 	if s.SelectionRange != s.Range {
 		t.Fatalf("selectionRange = %+v, want it to mirror range", s.SelectionRange)
+	}
+	if s.HasSelectionRange {
+		t.Fatal("SymbolInformation fallback range was marked as an identifier selectionRange")
 	}
 }
 

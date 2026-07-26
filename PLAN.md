@@ -1,6 +1,6 @@
 # Langer (LSP-MCP Bridge) — Implementation Plan
 
-**Companion:** `SPEC.md` v0.3 — the authoritative specification.
+**Companion:** `SPEC.md` v0.4 — the authoritative specification.
 **Language:** Go (single binary, `daemon` / `mcp` / `status` subcommands).
 **Target:** v0.1 success criteria in SPEC §11.
 
@@ -26,25 +26,33 @@
    never be weakened to pass.
 6. Errors are structured per SPEC §3.6 everywhere — no free-text error strings
    across IPC or MCP boundaries.
+7. **Platform gate.** Through M5, run every build/vet/test gate in the pinned
+   Go 1.26.5 Linux Docker environment while the pre-existing Windows port is
+   incomplete. M6 must add Windows process and local-IPC support, then run the
+   full gate on both Linux and Windows; v0.1 may not be declared Unix-only.
 
 ---
 
-## Status (2026-07-25)
+## Status (2026-07-26)
 
 | Milestone | State | Commit |
 |-----------|-------|--------|
 | M0 — scaffold, CLI, config, fixtures | **done** | `2d07acb` |
 | M1 — LSP client wrapper | **done** | `a400e7c` |
 | M2 — daemon process | **done**, reviewed + fixed | `da65ee8` + fixes |
-| M3 — SQLite index | not started | |
+| M3 — SQLite index | **done**, reviewed + race-hardened | `(this commit)` |
 | M4 — MCP frontend | not started | |
 | M5 — edits & speculative overlays | not started | |
-| M6 — security test, GC, v0.1 sign-off | not started | |
+| M6 — security, Windows, v0.1 sign-off | not started | |
 
-Verification gates all green at this point: `gofmt`, `go build`, `go vet`
-(plain and `-tags=integration`), `go test ./...`, `go test ./... -race`, and
+Verification gates are green through M3 in the pinned Go 1.26.5 Linux Docker
+runtime: changed-file `gofmt`, `go build`, `go vet` (plain and
+`-tags=integration`), `go test ./...`, `go test ./... -race`, and
 `go test -tags=integration ./...` driving the real typescript-language-server
-5.3.0 and pyright 1.1.411.
+5.3.0 and pyright 1.1.411. The M3 race gate found and fixed a supervisor
+shutdown race: restart/process workers now reserve their wait-group slots under
+the same lifecycle lock that begins shutdown, so no worker can be added after
+shutdown starts waiting.
 
 M0–M2 were each adversarially reviewed after implementation. That found real
 defects the passing test suite did not, and the pattern is worth keeping: in
@@ -68,13 +76,12 @@ Known and deliberately deferred rather than forgotten:
   before M6 signs off on process hygiene.
 - **SPEC §3.1's "configurable idle period" is not configurable** — no config
   key, and `cmd/langer` never sets one. Needs a `config` key.
-- **Windows does not build.** `internal/procx/run.go` uses `Setsid`,
+- **Windows does not build yet.** `internal/procx/run.go` uses `Setsid`,
   `Setpgid`, and `syscall.Kill` with no `_unix.go`/`_windows.go` split, and
-  the daemon transport is Unix-socket-only (SPEC's architecture diagram says
-  "Unix socket / named pipe"). All M0–M2 verification ran on Linux. Shipping
-  to claude-cli users includes Windows; either add a Windows port milestone
-  (build-tag procx, named-pipe or loopback-TCP transport, Windows CI) or
-  declare v0.1 Unix-only in SPEC §11 and README. Decide before M6 sign-off.
+  the daemon transport is Unix-socket-only. The approved resolution is binding:
+  M3–M5 verify in Linux Docker; M6 adds Windows process-tree cleanup, a secure
+  local transport, and Windows build/test coverage. Declaring v0.1 Unix-only is
+  not an alternative.
 
 ---
 
@@ -127,19 +134,46 @@ test.
 
 ### M3 — SQLite index (`index/`)
 
-- Schema per SPEC §5.1 including `symbols.stable_key` and stable-key-based
-  references; WAL mode + busy_timeout driver module (SPEC §3.2) — all access
-  through this one module.
-- Full index on first workspace open; file watcher; content-hash staleness;
-  cache-kill-on-change with live LSP fallback (SPEC §3.4); project-files-only
-  scope (deps and .gitignored paths excluded).
-- GC pass (deleted files, dead workspaces, expired diagnostics) guarded by an
-  advisory lock in `meta`.
+- First repair the Go 1.26 Linux baseline assertion that uses the removed
+  `syscall.Getsid`, without weakening its process-group behavior check.
+- Schema per SPEC §5.1. `stable_key` remains non-unique metadata.
+  `symbol_key = repo_namespace + U+001F + relative definition path + U+001F
+  + stable_key`; every operation remains workspace-ID scoped.
+- Derive `repo_namespace` from the normalized system-Git `origin` slug
+  (normally `<org>/<name>`, preserving deeper namespace paths) with the
+  canonical workspace root supplied by the CLI — normally cwd — as fallback.
+  Use no network lookup and never execute workspace-local Git.
+- Retain LSP `selectionRange` in the internal indexing shape and query
+  references at its start. If a `symbol_key` is still ambiguous in one
+  workspace/file, bypass the cache and ask the live server.
+- WAL mode + busy_timeout driver module (SPEC §3.2) — all access through this
+  one module. Replace file metadata/symbols/diagnostics atomically per file,
+  and replace each complete cross-file reference set independently and
+  atomically by `(workspace_id, symbol_key)`.
+- Start the watcher before the full/resumed scan. On a watcher batch, call the
+  daemon activity callback, synchronously invalidate/delete affected paths,
+  then queue indexing. Index disk text only under the per-document lock;
+  re-hash before commit and discard/reschedule raced work.
+- Content-hash staleness and cache-kill-on-change with live LSP fallback
+  (SPEC §3.4); project-files-only scope excludes dependencies, ignored files,
+  and denied dependency directories even when tracked. Workspace-wide
+  incomplete results return `NOT_READY`, never partial success.
+- `RegistryOptions` exposes `Store`, `NewScanner`, `NewWatcher`, and
+  `OnFileActivity` seams. `index_status` exposes `failed` with a structured
+  §3.6 error.
+- GC attempt hourly: 60-second expiring lease renewed every 20 seconds,
+  diagnostics retained seven days, missing workspaces retained 30 days.
+  `VACUUM` is shutdown-checkpoint-only and requires >25% reclaimable pages.
 - Index survives daemon restart (SPEC §11).
 
-**Accept:** unit tests for staleness/invalidation, stable_key reference
-survival across re-index, GC; integration test proving a file edit is
+**Accept:** red/green unit tests cover origin URL normalization and canonical
+root fallback; duplicate `stable_key` isolation and residual-ambiguity live
+fallback; independent atomic reference replacement; watcher-before-scan and
+scan/edit race discard; staleness/invalidation; structured failed status; and
+fake-clock GC lease/renewal/retention. Integration tests prove an edit is
 reflected without full re-index and the index answers after daemon restart.
+The complete plain, race, vet, build, and integration gates pass in Linux
+Docker.
 
 ### M4 — MCP frontend (`mcp/`)
 
@@ -168,10 +202,15 @@ are accurate with nothing written to disk (SPEC §11).
   an executable that writes a sentinel file if run) and assert the sentinel is
   never created.
 - Restrictive permissions on socket + DB (user-only).
+- Split process supervision into Unix and Windows implementations while
+  preserving whole-process-tree cleanup; add a secure Windows local transport
+  and endpoint/lock permissions; make `GOOS=windows go build ./...` and the
+  Windows unit/integration suite green.
 - Run the full SPEC §11 checklist; record results in `PLAN.md` under a
   "v0.1 verification" heading.
 
-**Accept:** all §11 criteria checked off with test evidence; full suite green.
+**Accept:** all §11 criteria checked off with test evidence; full suite green
+on Linux and Windows, including the tripwire and process-tree cleanup tests.
 
 ---
 

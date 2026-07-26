@@ -25,7 +25,7 @@ const (
 type connHandlers struct {
 	// diagnostics receives every textDocument/publishDiagnostics push. It runs
 	// on the reader goroutine, so it must not block.
-	diagnostics func(uri string, diags []wire.RawDiagnostic)
+	diagnostics func(uri string, version *int, diags []wire.RawDiagnostic)
 	// closed is invoked exactly once, when the reader stops. It is how the
 	// supervisor learns the server died.
 	closed func(err error)
@@ -261,7 +261,14 @@ func (c *conn) dispatchNotification(m wire.Message) {
 		c.log.Debug("lsp: undecodable publishDiagnostics", "error", err)
 		return
 	}
-	c.h.diagnostics(uri, diags)
+	var envelope struct {
+		Version *int `json:"version"`
+	}
+	if err := json.Unmarshal(m.Params, &envelope); err != nil {
+		c.log.Debug("lsp: undecodable publishDiagnostics version", "error", err)
+		return
+	}
+	c.h.diagnostics(uri, envelope.Version, diags)
 }
 
 // close tears the connection down and fails every pending call with

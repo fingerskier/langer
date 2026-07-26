@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/index"
 	"github.com/fingerskier/langer/internal/clock"
 	"github.com/fingerskier/langer/internal/procx"
 	"github.com/fingerskier/langer/internal/workspace"
@@ -52,6 +53,7 @@ const (
 	// backpressureRetryMS is the hint attached to a NOT_READY produced by the
 	// in-flight limit.
 	backpressureRetryMS = 100
+	sessionCleanupGrace = 2 * time.Second
 )
 
 // Options configures a daemon Server.
@@ -79,6 +81,11 @@ type Options struct {
 	// NewSupervisor builds the language server supervisor for a workspace.
 	// Defaults to lsp.NewSupervisor.
 	NewSupervisor func(lsp.Options) (lsp.Supervisor, error)
+
+	// OpenStore is the M3 persistence construction seam. Production uses
+	// index.Open; tests use it to prove that Run, rather than NewServer, owns
+	// the database and its GC/checkpoint lifecycle.
+	OpenStore func(context.Context, string, clock.Clock) (index.Store, error)
 }
 
 func (o *Options) applyDefaults() error {
@@ -115,6 +122,9 @@ func (o *Options) applyDefaults() error {
 	if o.WriteTimeout <= 0 {
 		o.WriteTimeout = DefaultWriteTimeout
 	}
+	if o.OpenStore == nil {
+		o.OpenStore = index.Open
+	}
 	return nil
 }
 
@@ -126,6 +136,13 @@ type Server struct {
 	core   *Core
 	sun    *sunset
 	socket string
+	store  index.Store
+
+	sessionCleanupTimeout time.Duration
+	endSessionFn          func(context.Context, protocol.EndSessionParams) (protocol.EmptyResult, error)
+
+	gcCancel context.CancelFunc
+	gcDone   chan struct{}
 
 	ready chan struct{}
 	sem   chan struct{}
@@ -228,30 +245,37 @@ func NewServer(opts Options) (*Server, error) {
 	}
 
 	log := opts.Logger.With("component", "daemon", "root", root)
-	reg := workspace.NewRegistry(workspace.RegistryOptions{
-		Config:        opts.Config,
-		Clock:         opts.Clock,
-		Logger:        opts.Logger,
-		Resolver:      opts.Resolver,
-		Runner:        opts.Runner,
-		NewSupervisor: opts.NewSupervisor,
-	})
+	reg := newWorkspaceRegistry(opts, nil, nil)
 
 	reqCtx, cancelReq := context.WithCancel(context.Background())
 	return &Server{
-		opts:      opts,
-		log:       log,
-		reg:       reg,
-		core:      NewCore(reg, opts.Clock),
-		sun:       newSunset(opts.Clock, opts.IdleTimeout, log),
-		socket:    socket,
-		ready:     make(chan struct{}),
-		sem:       make(chan struct{}, opts.MaxInFlight),
-		answering: newQuietGate(),
-		reqCtx:    reqCtx,
-		cancelReq: cancelReq,
-		conns:     map[net.Conn]struct{}{},
+		opts:                  opts,
+		log:                   log,
+		reg:                   reg,
+		core:                  NewCore(reg, opts.Clock),
+		sun:                   newSunset(opts.Clock, opts.IdleTimeout, log),
+		socket:                socket,
+		ready:                 make(chan struct{}),
+		sem:                   make(chan struct{}, opts.MaxInFlight),
+		answering:             newQuietGate(),
+		reqCtx:                reqCtx,
+		cancelReq:             cancelReq,
+		conns:                 map[net.Conn]struct{}{},
+		sessionCleanupTimeout: sessionCleanupGrace,
 	}, nil
+}
+
+func newWorkspaceRegistry(opts Options, store index.Store, onFileActivity func()) *workspace.Registry {
+	return workspace.NewRegistry(workspace.RegistryOptions{
+		Config:         opts.Config,
+		Store:          store,
+		Clock:          opts.Clock,
+		Logger:         opts.Logger,
+		Resolver:       opts.Resolver,
+		Runner:         opts.Runner,
+		NewSupervisor:  opts.NewSupervisor,
+		OnFileActivity: onFileActivity,
+	})
 }
 
 // Ready is closed once the daemon is listening. A client that spawned this
@@ -285,6 +309,14 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = lock.release() }()
+
+	if err := s.startIndex(ctx); err != nil {
+		return err
+	}
+	// If any later startup step fails, the Store still receives its orderly
+	// checkpoint and close. The normal shutdown path clears s.store, making
+	// this defer a no-op there.
+	defer s.finishIndex()
 
 	listener, err := listenUnix(s.socket)
 	if err != nil {
@@ -333,6 +365,10 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := s.reg.Shutdown(stopCtx); err != nil {
 		s.log.Warn("workspace shutdown reported an error", "error", err)
 	}
+	// 7. No index worker remains after Registry.Shutdown. Stop the periodic GC
+	// loop, wait for any lease-holding pass, then checkpoint/conditionally
+	// vacuum and close the shared database.
+	s.finishIndex()
 
 	// 8. Socket and lock go in the deferred calls above.
 	if reason == reasonContext && ctx.Err() != nil {
@@ -340,6 +376,84 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	}
 	return nil
+}
+
+// startIndex opens the shared database only after Run owns the daemon liveness
+// lock. An empty database path is the deliberate live-query-only seam retained
+// for the M2 unit tests and embedders.
+func (s *Server) startIndex(ctx context.Context) error {
+	if s.opts.Config.DatabasePath == "" {
+		return nil
+	}
+
+	store, err := s.opts.OpenStore(ctx, s.opts.Config.DatabasePath, s.opts.Clock)
+	if err != nil {
+		return protocol.AsError(err)
+	}
+	if store == nil {
+		return protocol.NewError(protocol.ErrInternal, "opening index returned a nil Store")
+	}
+	s.store = store
+	s.reg = newWorkspaceRegistry(s.opts, store, s.sun.noteActivity)
+	s.core = NewCore(s.reg, s.opts.Clock)
+
+	gcCtx, cancel := context.WithCancel(context.Background())
+	s.gcCancel = cancel
+	s.gcDone = make(chan struct{})
+	ticker := s.opts.Clock.NewTicker(index.DefaultGCAttemptInterval)
+	go s.runGC(gcCtx, ticker)
+	return nil
+}
+
+func (s *Server) runGC(ctx context.Context, ticker clock.Ticker) {
+	defer close(s.gcDone)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C():
+			ran, stats, err := s.store.GC(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					s.log.Warn("index garbage collection failed", "error", err)
+				}
+				continue
+			}
+			if ran {
+				s.log.Debug("index garbage collection completed",
+					"files_pruned", stats.FilesPruned,
+					"symbols_pruned", stats.SymbolsPruned,
+					"diagnostics_pruned", stats.DiagnosticsPruned,
+					"workspaces_pruned", stats.WorkspacesPruned)
+			}
+		}
+	}
+}
+
+// finishIndex is idempotent so startup failures and the normal shutdown path
+// can share it. Registry.Shutdown must run first on the normal path.
+func (s *Server) finishIndex() {
+	if s.store == nil {
+		return
+	}
+	if s.gcCancel != nil {
+		s.gcCancel()
+	}
+	if s.gcDone != nil {
+		<-s.gcDone
+	}
+
+	checkpointCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	if err := s.store.Checkpoint(checkpointCtx); err != nil {
+		s.log.Warn("index checkpoint reported an error", "error", err)
+	}
+	cancel()
+	if err := s.store.Close(); err != nil {
+		s.log.Warn("closing index reported an error", "error", err)
+	}
+	s.store = nil
 }
 
 // accept owns the listener and hands every connection to its own goroutine.
@@ -415,18 +529,24 @@ func (s *Server) serve(conn net.Conn) {
 	sessions := newSessionSet()
 
 	admitted := s.sun.addClient()
-	if admitted {
-		defer s.sun.removeClient()
-	}
 
 	// Every handler for this connection must finish before serve returns, or
 	// the daemon could tear down a language server out from under one.
 	var handlers sync.WaitGroup
 	defer func() {
 		handlers.Wait()
+		if admitted {
+			s.sun.removeClient()
+		}
+		timeout := s.sessionCleanupTimeout
+		if timeout <= 0 {
+			timeout = sessionCleanupGrace
+		}
+		cleanupCtx, cancel := context.WithTimeout(s.reqCtx, timeout)
+		defer cancel()
 		// The client is gone: drop everything its sessions owned (SPEC §4.2).
 		for _, id := range sessions.all() {
-			_, _ = s.core.EndSession(context.WithoutCancel(s.reqCtx), protocol.EndSessionParams{Session: id})
+			_, _ = s.endSession(cleanupCtx, protocol.EndSessionParams{Session: id})
 		}
 	}()
 
@@ -457,6 +577,13 @@ func (s *Server) serve(conn net.Conn) {
 			s.handle(codec, sessions, req)
 		}(req)
 	}
+}
+
+func (s *Server) endSession(ctx context.Context, p protocol.EndSessionParams) (protocol.EmptyResult, error) {
+	if s.endSessionFn != nil {
+		return s.endSessionFn(ctx, p)
+	}
+	return s.core.EndSession(ctx, p)
 }
 
 // reply writes one response, and never lets a failure to write become silence.

@@ -29,22 +29,36 @@ type scriptedServer struct {
 
 	mu       sync.Mutex
 	handlers map[string]handlerFunc
-	seen     []string
-	nextID   int64
-	pending  map[string]chan wire.Message
+	// notificationHandlers let restart tests synchronously react to a
+	// client-to-server notification (for example, publish diagnostics while a
+	// replayed didOpen is still in flight).
+	notificationHandlers map[string]func(json.RawMessage)
+	seen                 []string
+	// notifications retains params for document-state assertions. Requests
+	// are already observable through handlers; notifications otherwise were
+	// only counted by method name, which cannot prove a restore sent base text.
+	notifications []wire.Message
+	nextID        int64
+	pending       map[string]chan wire.Message
 
 	closeOnce sync.Once
 	done      chan struct{}
 	stop      func()
+
+	pauseMu                  sync.Mutex
+	pauseAfterNotification   string
+	pauseNotificationReached chan struct{}
+	pauseNotificationRelease <-chan struct{}
 }
 
 func newScriptedServer(t *testing.T, rw io.ReadWriter) *scriptedServer {
 	s := &scriptedServer{
-		t:        t,
-		framer:   wire.NewFramer(rw),
-		handlers: map[string]handlerFunc{},
-		pending:  map[string]chan wire.Message{},
-		done:     make(chan struct{}),
+		t:                    t,
+		framer:               wire.NewFramer(rw),
+		handlers:             map[string]handlerFunc{},
+		notificationHandlers: map[string]func(json.RawMessage){},
+		pending:              map[string]chan wire.Message{},
+		done:                 make(chan struct{}),
 	}
 	s.handle("initialize", func(json.RawMessage) (any, *wire.RPCError) {
 		return map[string]any{"capabilities": defaultCapabilities()}, nil
@@ -70,6 +84,12 @@ func (s *scriptedServer) handle(method string, fn handlerFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[method] = fn
+}
+
+func (s *scriptedServer) handleNotification(method string, fn func(json.RawMessage)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notificationHandlers[method] = fn
 }
 
 // reply is a convenience for handlers that answer with a fixed JSON literal.
@@ -139,11 +159,23 @@ func (s *scriptedServer) run() {
 			}(m)
 
 		case m.IsNotification():
+			s.recordNotification(m)
 			s.record(m.Method)
+			s.dispatchClientNotification(m.Method, m.Params)
+			s.maybePauseAfterNotification(m.Method)
 			if m.Method == "exit" {
 				return
 			}
 		}
+	}
+}
+
+func (s *scriptedServer) dispatchClientNotification(method string, params json.RawMessage) {
+	s.mu.Lock()
+	fn := s.notificationHandlers[method]
+	s.mu.Unlock()
+	if fn != nil {
+		fn(params)
 	}
 }
 
@@ -186,6 +218,58 @@ func (s *scriptedServer) countMethod(method string) int {
 	return n
 }
 
+func (s *scriptedServer) notificationParams(method string) []json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []json.RawMessage
+	for _, m := range s.notifications {
+		if m.Method != method {
+			continue
+		}
+		out = append(out, append(json.RawMessage(nil), m.Params...))
+	}
+	return out
+}
+
+func (s *scriptedServer) recordNotification(m wire.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.Params = append(json.RawMessage(nil), m.Params...)
+	s.notifications = append(s.notifications, m)
+}
+
+// pauseAfter blocks the scripted server's read loop immediately after it has
+// consumed and recorded the next notification named method. The client's
+// notification write has completed at that point, but its following write
+// cannot complete until release is closed. Restart tests use this to stop
+// resync between two didOpen writes without adding hooks to production code.
+func (s *scriptedServer) pauseAfter(method string, release <-chan struct{}) <-chan struct{} {
+	s.pauseMu.Lock()
+	defer s.pauseMu.Unlock()
+	reached := make(chan struct{})
+	s.pauseAfterNotification = method
+	s.pauseNotificationReached = reached
+	s.pauseNotificationRelease = release
+	return reached
+}
+
+func (s *scriptedServer) maybePauseAfterNotification(method string) {
+	s.pauseMu.Lock()
+	if s.pauseAfterNotification != method {
+		s.pauseMu.Unlock()
+		return
+	}
+	reached := s.pauseNotificationReached
+	release := s.pauseNotificationRelease
+	s.pauseAfterNotification = ""
+	s.pauseNotificationReached = nil
+	s.pauseNotificationRelease = nil
+	s.pauseMu.Unlock()
+
+	close(reached)
+	<-release
+}
+
 // push sends a server-initiated notification.
 func (s *scriptedServer) push(method string, params any) {
 	encoded, err := json.Marshal(params)
@@ -199,6 +283,18 @@ func (s *scriptedServer) push(method string, params any) {
 func (s *scriptedServer) publishDiagnostics(uri string, diagnostics []any) {
 	s.push("textDocument/publishDiagnostics", map[string]any{
 		"uri":         uri,
+		"diagnostics": diagnostics,
+	})
+}
+
+func (s *scriptedServer) publishDiagnosticsVersion(
+	uri string,
+	version int,
+	diagnostics []any,
+) {
+	s.push("textDocument/publishDiagnostics", map[string]any{
+		"uri":         uri,
+		"version":     version,
 		"diagnostics": diagnostics,
 	})
 }
@@ -416,4 +512,49 @@ func advanceUntil(t *testing.T, f *clock.Fake, limit, step time.Duration, cond f
 	if !cond() {
 		t.Fatalf("condition still false after %v of fake time", limit)
 	}
+}
+
+func notificationDocumentPaths(t *testing.T, root string, srv *scriptedServer, method string) []string {
+	t.Helper()
+	params := srv.notificationParams(method)
+	out := make([]string, 0, len(params))
+	for _, raw := range params {
+		var payload struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("decode %s params: %v", method, err)
+		}
+		path, ok := wire.URIToPath(root, payload.TextDocument.URI)
+		if !ok {
+			t.Fatalf("%s URI %q is outside %s", method, payload.TextDocument.URI, root)
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+func mutationGateState(srv Server) (readers, waitingReaders, waitingWriters int, writer bool) {
+	gate := &srv.(*server).mutations
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.readers, gate.waitingReaders, gate.waitingWriters, gate.writer
+}
+
+func candidateAnalysisState(h *harness) *analysisState {
+	sup := h.sup.(*supervisor)
+	sup.mu.Lock()
+	m := sup.managed["typescript"]
+	sup.mu.Unlock()
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.candidate == nil {
+		return nil
+	}
+	return &m.candidate.analysis
 }

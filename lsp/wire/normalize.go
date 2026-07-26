@@ -57,20 +57,42 @@ func preview(line string) string {
 	return strings.TrimSpace(line)
 }
 
+// NormalizedSymbol is the internal, lossless normalized symbol shape used by
+// M3 indexing. The public protocol.Symbol deliberately omits SelectionRange,
+// but reference discovery must target the identifier rather than the start of
+// a declaration's potentially broad Range.
+type NormalizedSymbol struct {
+	Symbol            protocol.Symbol
+	SelectionRange    protocol.Range
+	HasSelectionRange bool
+}
+
 // FlattenSymbols turns a possibly hierarchical symbol tree into the SPEC §4.4
 // flat list, deriving `container` from the parent chain (docs §10.4 — Symbol
-// deliberately has no children field).
+// deliberately has no children field). It is the public lossy view over
+// FlattenSymbolsForIndex, so the two paths cannot disagree about normalization.
 //
 // relPath is used for DocumentSymbol results, which carry no URI of their own.
 // SymbolInformation results DO carry one — that is what workspace/symbol
 // returns — and their own URI always wins.
 func FlattenSymbols(root, relPath string, raws []RawSymbol) []protocol.Symbol {
-	var out []protocol.Symbol
-	flattenInto(&out, root, relPath, "", raws)
+	normalized := FlattenSymbolsForIndex(root, relPath, raws)
+	out := make([]protocol.Symbol, 0, len(normalized))
+	for _, symbol := range normalized {
+		out = append(out, symbol.Symbol)
+	}
 	return out
 }
 
-func flattenInto(out *[]protocol.Symbol, root, relPath, container string, raws []RawSymbol) {
+// FlattenSymbolsForIndex preserves the LSP selectionRange while applying the
+// same path, kind and container normalization as FlattenSymbols.
+func FlattenSymbolsForIndex(root, relPath string, raws []RawSymbol) []NormalizedSymbol {
+	var out []NormalizedSymbol
+	flattenSymbolsForIndexInto(&out, root, relPath, "", raws)
+	return out
+}
+
+func flattenSymbolsForIndexInto(out *[]NormalizedSymbol, root, relPath, container string, raws []RawSymbol) {
 	for _, r := range raws {
 		path := relPath
 		if r.URI != "" {
@@ -88,17 +110,21 @@ func flattenInto(out *[]protocol.Symbol, root, relPath, container string, raws [
 			effective = r.Container
 		}
 
-		*out = append(*out, protocol.Symbol{
-			Name:      r.Name,
-			Kind:      protocol.SymbolKindFromLSP(r.Kind),
-			Container: effective,
-			Path:      path,
-			Range:     ToRange(r.Range),
-			Detail:    r.Detail,
+		*out = append(*out, NormalizedSymbol{
+			Symbol: protocol.Symbol{
+				Name:      r.Name,
+				Kind:      protocol.SymbolKindFromLSP(r.Kind),
+				Container: effective,
+				Path:      path,
+				Range:     ToRange(r.Range),
+				Detail:    r.Detail,
+			},
+			SelectionRange:    ToRange(r.SelectionRange),
+			HasSelectionRange: r.HasSelectionRange,
 		})
 
 		if len(r.Children) > 0 {
-			flattenInto(out, root, path, r.Name, r.Children)
+			flattenSymbolsForIndexInto(out, root, path, r.Name, r.Children)
 		}
 	}
 }

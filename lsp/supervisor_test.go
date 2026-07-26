@@ -488,6 +488,576 @@ func TestSupervisorResyncsOpenDocumentsAfterRestart(t *testing.T) {
 	})
 }
 
+func TestSupervisorRestartWaitsForDiskTextRestoreBeforeResync(t *testing.T) {
+	h := newHarness(t, nil, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	const base = "export const value = 'base';"
+	const disk = "export const value = 'disk';"
+	if _, err := srv.Open(testContext(t), "src/user.ts", "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	waitFor(t, "the first didOpen", func() bool {
+		return h.runner.server(1).sawMethod("textDocument/didOpen")
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	diskDone := make(chan error, 1)
+	ctx := testContext(t)
+	go func() {
+		diskDone <- srv.WithDiskText(ctx, "src/user.ts", "typescript", disk,
+			func(context.Context, uint64) error {
+				close(entered)
+				<-release
+				return nil
+			})
+	}()
+	<-entered
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	waitFor(t, "replacement process initialized", func() bool { return h.runner.startCount() == 2 })
+
+	waitFor(t, "restart to wait on the document mutation gate", func() bool {
+		_, _, waitingWriters, _ := mutationGateState(srv)
+		return waitingWriters > 0
+	})
+	if h.runner.server(2).sawMethod("textDocument/didOpen") {
+		t.Fatal("restart resynced the temporary disk view before WithDiskText restored it")
+	}
+	if got := h.sup.Status()[0].State; got != protocol.ServerStarting {
+		t.Fatalf("server state while disk view is held = %s, want starting", got)
+	}
+
+	close(release)
+	if err := <-diskDone; err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+	waitFor(t, "the restored document to be resynced", func() bool {
+		return h.runner.server(2).sawMethod("textDocument/didOpen")
+	})
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+	if got := srv.Generation(); got != 2 {
+		t.Fatalf("generation after resync = %d, want 2", got)
+	}
+
+	replacement := h.runner.server(2)
+	if got := notificationDocumentTexts(t, replacement, "textDocument/didOpen"); len(got) != 1 || got[0] != base {
+		t.Fatalf("replacement didOpen texts = %q, want restored base [%q]", got, base)
+	}
+	if got := replacement.countMethod("textDocument/didChange"); got != 0 {
+		t.Fatalf("replacement received %d didChange notifications before/after resync, want 0", got)
+	}
+}
+
+func TestSupervisorRestartWaitsForSpeculativeTextRestoreBeforeResync(t *testing.T) {
+	h := newHarness(t, nil, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	const base = "export const value = 'base';"
+	const overlay = "export const value = 'overlay';"
+	if _, err := srv.Open(testContext(t), "src/user.ts", "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	waitFor(t, "the first didOpen", func() bool {
+		return h.runner.server(1).sawMethod("textDocument/didOpen")
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	editDone := make(chan error, 1)
+	ctx := testContext(t)
+	go func() {
+		editDone <- srv.WithText(ctx, "src/user.ts", overlay,
+			func(context.Context, uint64) error {
+				close(entered)
+				<-release
+				return nil
+			})
+	}()
+	<-entered
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	waitFor(t, "replacement process initialized", func() bool { return h.runner.startCount() == 2 })
+
+	waitFor(t, "restart to wait on the document mutation gate", func() bool {
+		_, _, waitingWriters, _ := mutationGateState(srv)
+		return waitingWriters > 0
+	})
+	if h.runner.server(2).sawMethod("textDocument/didOpen") {
+		t.Fatal("restart resynced speculative text before WithText restored it")
+	}
+	if got := h.sup.Status()[0].State; got != protocol.ServerStarting {
+		t.Fatalf("server state while speculative text is held = %s, want starting", got)
+	}
+
+	close(release)
+	if err := <-editDone; err != nil {
+		t.Fatalf("WithText: %v", err)
+	}
+	waitFor(t, "the restored document to be resynced", func() bool {
+		return h.runner.server(2).sawMethod("textDocument/didOpen")
+	})
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+
+	replacement := h.runner.server(2)
+	if got := notificationDocumentTexts(t, replacement, "textDocument/didOpen"); len(got) != 1 || got[0] != base {
+		t.Fatalf("replacement didOpen texts = %q, want restored base [%q]", got, base)
+	}
+	text, _, _, open := h.docsFor(srv).state("src/user.ts")
+	if !open || text != base {
+		t.Fatalf("local state after restart = (%q, open=%v), want base %q", text, open, base)
+	}
+}
+
+func TestSupervisorCloseWaitsThroughResyncPublication(t *testing.T) {
+	releaseSecondOpen := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseSecondOpen)
+		}
+	}()
+	pauseConfigured := make(chan (<-chan struct{}), 1)
+	h := newHarness(t, func(n int, s *scriptedServer) {
+		if n == 2 {
+			pauseConfigured <- s.pauseAfter("textDocument/didOpen", releaseSecondOpen)
+		}
+	}, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	for _, path := range []string{"src/a.ts", "src/b.ts"} {
+		if _, err := srv.Open(testContext(t), path, "typescript", "export const value = 1;"); err != nil {
+			t.Fatalf("Open(%s): %v", path, err)
+		}
+	}
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	reached := <-pauseConfigured
+	<-reached
+
+	replacement := h.runner.server(2)
+	opened := notificationDocumentPaths(t, h.root, replacement, "textDocument/didOpen")
+	if len(opened) != 1 {
+		t.Fatalf("replacement had replayed %d documents at pause, want 1: %v", len(opened), opened)
+	}
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- srv.Close(testContext(t), opened[0])
+	}()
+
+	waitFor(t, "Close to wait behind resync publication", func() bool {
+		_, waitingReaders, _, writer := mutationGateState(srv)
+		return writer && waitingReaders > 0
+	})
+	select {
+	case closeErr := <-closeDone:
+		t.Fatalf("Close completed after its path replay but before replacement publication: %v", closeErr)
+	default:
+	}
+
+	close(releaseSecondOpen)
+	released = true
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close remained blocked after resync publication")
+	}
+	if closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
+	waitFor(t, "didClose on the published replacement", func() bool {
+		return replacement.countMethod("textDocument/didClose") == 1
+	})
+	if got := notificationDocumentPaths(t, h.root, replacement, "textDocument/didClose"); len(got) != 1 || got[0] != opened[0] {
+		t.Fatalf("replacement didClose paths = %v, want [%s]", got, opened[0])
+	}
+}
+
+func TestSupervisorProgressCompletedDuringResyncSurvivesPublication(t *testing.T) {
+	releaseSecondOpen := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseSecondOpen)
+		}
+	}()
+	pauseConfigured := make(chan (<-chan struct{}), 1)
+	h := newHarness(t, func(n int, s *scriptedServer) {
+		s.handle("initialize", func(json.RawMessage) (any, *wire.RPCError) {
+			caps := defaultCapabilities()
+			caps["workspaceSymbolProvider"] = map[string]any{"workDoneProgress": true}
+			return map[string]any{"capabilities": caps}, nil
+		})
+		s.handle("workspace/symbol", func(json.RawMessage) (any, *wire.RPCError) {
+			return []any{}, nil
+		})
+		if n == 2 {
+			pauseConfigured <- s.pauseAfter("textDocument/didOpen", releaseSecondOpen)
+		}
+	}, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	for _, path := range []string{"src/a.ts", "src/b.ts"} {
+		if _, err := srv.Open(testContext(t), path, "typescript", "export const value = 1;"); err != nil {
+			t.Fatalf("Open(%s): %v", path, err)
+		}
+	}
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	reached := <-pauseConfigured
+	<-reached
+
+	h.runner.server(2).push("pyright/endProgress", []any{nil})
+	waitFor(t, "replacement analysis completion", func() bool {
+		analysis := candidateAnalysisState(h)
+		return analysis != nil && analysis.indexed.Load()
+	})
+
+	close(releaseSecondOpen)
+	released = true
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+	if _, err := srv.WorkspaceSymbols(testContext(t), "absent", 10); err != nil {
+		t.Fatalf("completed replacement analysis was forgotten at publication: %v", err)
+	}
+}
+
+func TestSupervisorDropsInitializeDiagnosticsBeforeReplay(t *testing.T) {
+	const path = "src/user.ts"
+	var h *harness
+	h = newHarness(t, func(n int, s *scriptedServer) {
+		if n != 2 {
+			return
+		}
+		s.handle("initialize", func(json.RawMessage) (any, *wire.RPCError) {
+			s.publishDiagnostics(uriIn(h.root, path), []any{map[string]any{
+				"range": map[string]any{
+					"start": map[string]any{"line": 0, "character": 0},
+					"end":   map[string]any{"line": 0, "character": 1},
+				},
+				"message": "stale disk diagnostic",
+			}})
+			return map[string]any{"capabilities": defaultCapabilities()}, nil
+		})
+	}, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := srv.Open(testContext(t), path, "typescript", "export const value = 1;"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+
+	impl := srv.(*server)
+	if got, _, ok := impl.diags.snapshot(path); ok {
+		t.Fatalf("initialize-time diagnostics survived authoritative replay: %+v", got)
+	}
+
+	h.runner.server(2).publishDiagnostics(uriIn(h.root, path), []any{map[string]any{
+		"range": map[string]any{
+			"start": map[string]any{"line": 0, "character": 0},
+			"end":   map[string]any{"line": 0, "character": 1},
+		},
+		"message": "fresh replayed diagnostic",
+	}})
+	waitFor(t, "post-publication diagnostics", func() bool {
+		got, _, ok := impl.diags.snapshot(path)
+		return ok && len(got) == 1 && got[0].Message == "fresh replayed diagnostic"
+	})
+}
+
+func TestSupervisorPreservesDiagnosticsPublishedDuringReplay(t *testing.T) {
+	const path = "src/user.ts"
+	var h *harness
+	h = newHarness(t, func(n int, s *scriptedServer) {
+		if n != 2 {
+			return
+		}
+		s.handleNotification("textDocument/didOpen", func(json.RawMessage) {
+			s.publishDiagnostics(uriIn(h.root, path), []any{map[string]any{
+				"range": map[string]any{
+					"start": map[string]any{"line": 0, "character": 0},
+					"end":   map[string]any{"line": 0, "character": 1},
+				},
+				"message": "diagnostic caused by replay",
+			}})
+		})
+	}, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := srv.Open(testContext(t), path, "typescript", "export const value = 1;"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	waitFor(t, "replacement server ready", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerReady
+	})
+
+	impl := srv.(*server)
+	waitFor(t, "buffered replay diagnostics", func() bool {
+		got, _, ok := impl.diags.snapshot(path)
+		return ok && len(got) == 1 && got[0].Message == "diagnostic caused by replay"
+	})
+}
+
+func TestSupervisorFailedCandidateProgressCannotBlessReplacement(t *testing.T) {
+	failedProgressSent := make(chan struct{})
+	h := newHarness(t, func(n int, s *scriptedServer) {
+		s.handle("initialize", func(json.RawMessage) (any, *wire.RPCError) {
+			if n == 2 {
+				s.push("pyright/endProgress", []any{nil})
+				close(failedProgressSent)
+				return nil, &wire.RPCError{Code: -32603, Message: "candidate initialize failed"}
+			}
+			caps := defaultCapabilities()
+			caps["workspaceSymbolProvider"] = map[string]any{"workDoneProgress": true}
+			return map[string]any{"capabilities": caps}, nil
+		})
+		s.handle("workspace/symbol", func(json.RawMessage) (any, *wire.RPCError) {
+			return []any{}, nil
+		})
+	}, func(o *Options) { o.BackoffInitial = time.Second })
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	h.runner.process(1).crash()
+	waitFor(t, "backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	select {
+	case <-failedProgressSent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed candidate never emitted progress")
+	}
+	waitFor(t, "failed candidate backoff", func() bool {
+		return h.runner.startCount() == 2 &&
+			h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+
+	h.clock.BlockUntil(1)
+	h.clock.Advance(2 * time.Second)
+	waitFor(t, "replacement server ready", func() bool {
+		return h.runner.startCount() == 3 &&
+			h.sup.Status()[0].State == protocol.ServerReady
+	})
+	_, err = srv.WorkspaceSymbols(testContext(t), "absent", 10)
+	if code := structuredCode(t, err); code != protocol.ErrNotReady {
+		t.Fatalf("empty symbols after only failed-candidate progress returned %s, want NOT_READY", code)
+	}
+}
+
+func TestSupervisorRestartWaitsForPriorStartAttemptToFinish(t *testing.T) {
+	h := newHarness(t, nil, func(o *Options) { o.BackoffInitial = time.Second })
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	const (
+		path    = "src/user.ts"
+		base    = "export const value = 'base';"
+		overlay = "export const value = 'overlay';"
+	)
+	if _, err := srv.Open(testContext(t), path, "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	editDone := make(chan error, 1)
+	go func() {
+		editDone <- srv.WithText(testContext(t), path, overlay, func(context.Context, uint64) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	h.runner.process(1).crash()
+	waitFor(t, "first backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	waitFor(t, "second process waiting on mutation gate", func() bool {
+		if h.runner.startCount() != 2 {
+			return false
+		}
+		_, _, waitingWriters, _ := mutationGateState(srv)
+		return waitingWriters > 0
+	})
+
+	acquireDone := make(chan error, 1)
+	go func() {
+		_, err := h.sup.Acquire(testContext(t), "typescript")
+		acquireDone <- err
+	}()
+
+	h.runner.process(2).crash()
+	waitFor(t, "second backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(2 * time.Second)
+	if got := h.runner.startCount(); got != 2 {
+		t.Fatalf("started generation 3 before generation 2 startAttempt returned: starts=%d", got)
+	}
+
+	close(release)
+	released = true
+	if err := <-editDone; err != nil {
+		t.Fatalf("WithText: %v", err)
+	}
+	waitFor(t, "third process ready", func() bool {
+		return h.runner.startCount() == 3 &&
+			h.sup.Status()[0].State == protocol.ServerReady
+	})
+	select {
+	case <-acquireDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire remained stranded on the prior startAttempt ready channel")
+	}
+}
+
+func TestSupervisorDoesNotPublishCandidateClosedAfterReplay(t *testing.T) {
+	const path = "src/user.ts"
+	closedAtPublication := make(chan struct{})
+	var h *harness
+	h = newHarness(t, nil, func(o *Options) {
+		o.BackoffInitial = time.Second
+		o.beforePublish = func(generation uint64) {
+			if generation != 2 {
+				return
+			}
+			// Close at the exact post-replay/pre-publication boundary. A server
+			// notification handler cannot establish this ordering: io.Pipe.Write
+			// may return as soon as the frame is consumed, before that handler
+			// runs, which made the former test race publication rather than test it.
+			h.runner.process(2).crash()
+			waitFor(t, "closed replacement backoff", func() bool {
+				return h.sup.Status()[0].State == protocol.ServerBackoff
+			})
+			close(closedAtPublication)
+		}
+	})
+
+	srv, err := h.sup.Acquire(testContext(t), "typescript")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := srv.Open(testContext(t), path, "typescript", "export const value = 1;"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	h.runner.process(1).crash()
+	waitFor(t, "first backoff", func() bool {
+		return h.sup.Status()[0].State == protocol.ServerBackoff
+	})
+	h.clock.BlockUntil(1)
+	h.clock.Advance(time.Second)
+	select {
+	case <-closedAtPublication:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement never reached the publication boundary")
+	}
+	waitFor(t, "failed publication gate release", func() bool {
+		_, _, _, writer := mutationGateState(srv)
+		return !writer
+	})
+	if got := srv.Generation(); got != 1 {
+		t.Fatalf("published closed candidate generation %d, want last live generation 1", got)
+	}
+	if _, err := srv.(*server).live(); structuredCode(t, err) != protocol.ErrServerCrashed {
+		t.Fatalf("closed candidate remained live: %v", err)
+	}
+}
+
 // index_status must never have the side effect of spawning a language server.
 func TestSupervisorStatusNeverStartsAnything(t *testing.T) {
 	h := newHarness(t, nil, nil)

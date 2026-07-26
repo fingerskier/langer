@@ -164,6 +164,60 @@ func TestFlattenSymbolsDerivesContainerFromTheParentChain(t *testing.T) {
 	}
 }
 
+func TestFlattenSymbolsForIndexRetainsSelectionRange(t *testing.T) {
+	t.Parallel()
+	raws := []wire.RawSymbol{{
+		Name: "UserService", Kind: 5,
+		Range: wire.RawRange{
+			Start: wire.RawPosition{Line: 3, Character: 0},
+			End:   wire.RawPosition{Line: 20, Character: 1},
+		},
+		SelectionRange: wire.RawRange{
+			Start: wire.RawPosition{Line: 3, Character: 6},
+			End:   wire.RawPosition{Line: 3, Character: 17},
+		},
+		Children: []wire.RawSymbol{{
+			Name: "getUserById", Kind: 6,
+			Range: wire.RawRange{
+				Start: wire.RawPosition{Line: 8, Character: 1},
+				End:   wire.RawPosition{Line: 12, Character: 2},
+			},
+			SelectionRange: wire.RawRange{
+				Start: wire.RawPosition{Line: 8, Character: 9},
+				End:   wire.RawPosition{Line: 8, Character: 20},
+			},
+		}},
+	}}
+
+	got := wire.FlattenSymbolsForIndex(root, "src/user/service.ts", raws)
+	if len(got) != 2 {
+		t.Fatalf("got %d symbols, want 2", len(got))
+	}
+	if got[0].Symbol.Name != "UserService" {
+		t.Fatalf("parent = %+v", got[0])
+	}
+	if got[0].SelectionRange != (protocol.Range{
+		Start: protocol.Position{Line: 3, Character: 6},
+		End:   protocol.Position{Line: 3, Character: 17},
+	}) {
+		t.Fatalf("parent selection range = %+v", got[0].SelectionRange)
+	}
+	if got[1].Symbol.Container != "UserService" {
+		t.Fatalf("child = %+v", got[1])
+	}
+	if got[1].SelectionRange != (protocol.Range{
+		Start: protocol.Position{Line: 8, Character: 9},
+		End:   protocol.Position{Line: 8, Character: 20},
+	}) {
+		t.Fatalf("child selection range = %+v", got[1].SelectionRange)
+	}
+
+	public := wire.FlattenSymbols(root, "src/user/service.ts", raws)
+	if len(public) != len(got) || public[1] != got[1].Symbol {
+		t.Fatalf("public symbols diverged from detailed normalization:\npublic=%+v\ndetailed=%+v", public, got)
+	}
+}
+
 // workspace/symbol results are SymbolInformation and carry their own URI; the
 // relPath argument must not override it.
 func TestFlattenSymbolsUsesTheSymbolsOwnURI(t *testing.T) {

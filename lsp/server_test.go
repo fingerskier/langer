@@ -313,6 +313,44 @@ func TestDocumentSymbolsFlattenWithContainer(t *testing.T) {
 	}
 }
 
+func TestDocumentSymbolsForIndexRetainsSelectionRange(t *testing.T) {
+	_, srv := acquire(t, func(s *scriptedServer) {
+		s.handle("textDocument/documentSymbol", reply(`[{
+			"name":"User","kind":5,
+			"range":{"start":{"line":3,"character":0},"end":{"line":6,"character":24}},
+			"selectionRange":{"start":{"line":3,"character":6},"end":{"line":3,"character":10}},
+			"children":[{
+				"name":"__init__","kind":6,
+				"range":{"start":{"line":4,"character":4},"end":{"line":6,"character":24}},
+				"selectionRange":{"start":{"line":4,"character":8},"end":{"line":4,"character":16}}
+			}]
+		}]`))
+	}, nil)
+
+	got, err := srv.DocumentSymbolsForIndex(testContext(t), "user.py")
+	if err != nil {
+		t.Fatalf("DocumentSymbolsForIndex: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d symbols, want 2", len(got))
+	}
+	if got[0].Name != "User" || got[0].Path != "user.py" {
+		t.Fatalf("parent = %+v", got[0])
+	}
+	if got[0].SelectionRange != (protocol.Range{
+		Start: protocol.Position{Line: 3, Character: 6},
+		End:   protocol.Position{Line: 3, Character: 10},
+	}) {
+		t.Fatalf("parent selection range = %+v", got[0].SelectionRange)
+	}
+	if got[1].Name != "__init__" || got[1].Container != "User" {
+		t.Fatalf("child = %+v", got[1])
+	}
+	if got[1].SelectionRange.Start != (protocol.Position{Line: 4, Character: 8}) {
+		t.Fatalf("child selection start = %+v", got[1].SelectionRange.Start)
+	}
+}
+
 // SymbolInformation is equally legal, and its own URI wins over the requested
 // path — that is what workspace/symbol returns.
 func TestDocumentSymbolsAcceptSymbolInformation(t *testing.T) {
@@ -476,6 +514,64 @@ func TestWithTextRestoresAfterAFailedCallback(t *testing.T) {
 	}
 }
 
+func TestWithTextRestoresWhenOverlayPushCrashes(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	const base = "const x = 1;"
+	const overlay = "const x = 2;"
+	releaseReads := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseReads)
+		}
+	}()
+	paused := h.runner.server(1).pauseAfter("textDocument/didOpen", releaseReads)
+	if _, err := srv.Open(ctx, "a.ts", "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	<-paused
+
+	callbackCalled := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.WithText(ctx, "a.ts", overlay, func(context.Context, uint64) error {
+			callbackCalled <- struct{}{}
+			return nil
+		})
+	}()
+
+	impl := srv.(*server)
+	waitFor(t, "the speculative local state before the blocked didChange", func() bool {
+		text, _, _, _ := impl.docs.state("a.ts")
+		return text == overlay
+	})
+	h.runner.process(1).crash()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WithText did not return after its notification connection crashed")
+	}
+	close(releaseReads)
+	released = true
+
+	if code := structuredCode(t, err); code != protocol.ErrServerCrashed {
+		t.Fatalf("WithText push failure returned %s, want SERVER_CRASHED", code)
+	}
+	select {
+	case <-callbackCalled:
+		t.Fatal("WithText ran its callback after the overlay push failed")
+	default:
+	}
+	text, _, _, open := impl.docs.state("a.ts")
+	if !open || text != base {
+		t.Fatalf("state after failed overlay push = (%q, open=%v), want restored base %q", text, open, base)
+	}
+}
+
 // Versions must be strictly increasing for the life of the process: a server
 // that sees a version go backwards may silently keep its old view of the file.
 func TestDocumentVersionsAreStrictlyIncreasing(t *testing.T) {
@@ -543,6 +639,370 @@ func TestWithTextCallbackCanAskForDiagnostics(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("simulate_edit deadlocked against its own diagnostics query")
 	}
+}
+
+func TestWithTextCallbackContextCannotBypassLocksAfterReturn(t *testing.T) {
+	_, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+	const path = "a.ts"
+	if _, err := srv.Open(ctx, path, "typescript", "const x = 1;"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	var callbackCtx context.Context
+	if err := srv.WithText(ctx, path, "const x = 2;", func(inner context.Context, _ uint64) error {
+		callbackCtx = inner
+		return nil
+	}); err != nil {
+		t.Fatalf("WithText: %v", err)
+	}
+
+	impl := srv.(*server)
+	if err := impl.mutations.writeLock(ctx); err != nil {
+		t.Fatalf("lock publication gate: %v", err)
+	}
+	heldDoc, err := impl.docs.acquire(ctx, path)
+	if err != nil {
+		impl.mutations.writeUnlock()
+		t.Fatalf("lock document: %v", err)
+	}
+	gateUnlocked := false
+	docUnlocked := false
+	defer func() {
+		if !docUnlocked {
+			impl.docs.release(heldDoc)
+		}
+		if !gateUnlocked {
+			impl.mutations.writeUnlock()
+		}
+	}()
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- srv.Close(callbackCtx, path)
+	}()
+	waitFor(t, "captured callback context to reacquire the publication gate", func() bool {
+		_, waitingReaders, _, writer := mutationGateState(srv)
+		return writer && waitingReaders > 0
+	})
+	select {
+	case err := <-closeDone:
+		t.Fatalf("captured callback context bypassed an active publication gate: %v", err)
+	default:
+	}
+
+	impl.mutations.writeUnlock()
+	gateUnlocked = true
+	waitFor(t, "captured callback context to reacquire the document lock", func() bool {
+		readers, _, _, _ := mutationGateState(srv)
+		return readers > 0
+	})
+	select {
+	case err := <-closeDone:
+		t.Fatalf("captured callback context bypassed an active document lock: %v", err)
+	default:
+	}
+	impl.docs.release(heldDoc)
+	docUnlocked = true
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close after publication gate released: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not resume after publication gate released")
+	}
+}
+
+func TestWithDiskTextOpensAndClosesAPreviouslyClosedDocument(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	const disk = "export const indexed = true;"
+	var callbackEpoch uint64
+	if err := srv.WithDiskText(ctx, "a.ts", "typescript", disk, func(inner context.Context, epoch uint64) error {
+		callbackEpoch = epoch
+		if !holdsDocLock(inner, "a.ts") {
+			t.Fatal("WithDiskText callback context does not mark the document lock held")
+		}
+		text, _, languageID, open := h.docsFor(srv).state("a.ts")
+		if !open || text != disk || languageID != "typescript" {
+			t.Fatalf("inside WithDiskText state = (%q, %q, %v)", text, languageID, open)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+	if callbackEpoch == 0 {
+		t.Fatal("WithDiskText returned a zero diagnostics epoch")
+	}
+
+	scripted := h.runner.server(1)
+	waitFor(t, "didOpen and didClose", func() bool {
+		return scripted.countMethod("textDocument/didOpen") == 1 &&
+			scripted.countMethod("textDocument/didClose") == 1
+	})
+	if got := notificationDocumentTexts(t, scripted, "textDocument/didOpen"); len(got) != 1 || got[0] != disk {
+		t.Fatalf("didOpen texts = %q, want [%q]", got, disk)
+	}
+	text, _, languageID, open := h.docsFor(srv).state("a.ts")
+	if open || text != "" || languageID != "" {
+		t.Fatalf("after WithDiskText state = (%q, %q, %v), want original closed state", text, languageID, open)
+	}
+}
+
+func TestWithDiskTextRestoresAPreviouslyOpenDocument(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	const base = "export const value = 'base';"
+	const disk = "export const value = 'disk';"
+	if _, err := srv.Open(ctx, "a.ts", "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := srv.WithDiskText(ctx, "a.ts", "typescriptreact", disk, func(context.Context, uint64) error {
+		text, _, languageID, open := h.docsFor(srv).state("a.ts")
+		if !open || text != disk || languageID != "typescript" {
+			t.Fatalf("inside WithDiskText state = (%q, %q, %v)", text, languageID, open)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+
+	scripted := h.runner.server(1)
+	waitFor(t, "disk change and base restore", func() bool {
+		return scripted.countMethod("textDocument/didChange") == 2
+	})
+	if got := notificationDocumentTexts(t, scripted, "textDocument/didChange"); len(got) != 2 || got[0] != disk || got[1] != base {
+		t.Fatalf("didChange texts = %q, want [%q %q]", got, disk, base)
+	}
+	if got := scripted.countMethod("textDocument/didClose"); got != 0 {
+		t.Fatalf("didClose count = %d for a document that was already open", got)
+	}
+	text, _, languageID, open := h.docsFor(srv).state("a.ts")
+	if !open || text != base || languageID != "typescript" {
+		t.Fatalf("after WithDiskText state = (%q, %q, %v), want original open state", text, languageID, open)
+	}
+}
+
+func TestWithDiskTextSameOpenTextUsesCurrentEpochWithoutNotifications(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	const (
+		path = "a.ts"
+		text = "export const value = 'disk';"
+	)
+	if _, err := srv.Open(ctx, path, "typescript", text); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	scripted := h.runner.server(1)
+	waitFor(t, "initial didOpen", func() bool {
+		return scripted.countMethod("textDocument/didOpen") == 1
+	})
+
+	impl := srv.(*server)
+	_, versionBefore, _, _ := impl.docs.state(path)
+	impl.diags.publishVersioned(path, versionBefore, nil)
+	wantEpoch := impl.diags.current(path)
+	didChangeBefore := scripted.countMethod("textDocument/didChange")
+	didCloseBefore := scripted.countMethod("textDocument/didClose")
+
+	var callbackEpoch uint64
+	if err := srv.WithDiskText(ctx, path, "TypeScript", text, func(inner context.Context, epoch uint64) error {
+		callbackEpoch = epoch
+		if !holdsDocLock(inner, path) {
+			t.Fatal("same-text callback context does not mark the document lock held")
+		}
+		if got := impl.diags.current(path); epoch != got {
+			t.Fatalf("callback epoch = %d, want current epoch %d", epoch, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+
+	if callbackEpoch != wantEpoch {
+		t.Fatalf("callback epoch = %d, want pre-existing current epoch %d", callbackEpoch, wantEpoch)
+	}
+	_, versionAfter, languageID, open := impl.docs.state(path)
+	if !open || languageID != "typescript" {
+		t.Fatalf("document state after same-text indexing = (language=%q, open=%v)", languageID, open)
+	}
+	if versionAfter != versionBefore {
+		t.Fatalf("document version after same-text indexing = %d, want unchanged %d", versionAfter, versionBefore)
+	}
+	if got := scripted.countMethod("textDocument/didChange"); got != didChangeBefore {
+		t.Fatalf("didChange count after same-text indexing = %d, want unchanged %d", got, didChangeBefore)
+	}
+	if got := scripted.countMethod("textDocument/didClose"); got != didCloseBefore {
+		t.Fatalf("didClose count after same-text indexing = %d, want unchanged %d", got, didCloseBefore)
+	}
+}
+
+func TestWithDiskTextSameTextDoesNotReuseRestoredOverlayDiagnostics(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+	const (
+		path = "a.ts"
+		base = "export const value = 'base';"
+	)
+	if _, err := srv.Open(ctx, path, "typescript", base); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	impl := srv.(*server)
+	var (
+		overlayEpoch   uint64
+		overlayVersion int
+	)
+	if err := srv.WithText(ctx, path, "export const value: string = 1;", func(context.Context, uint64) error {
+		impl.diags.publish(path, []protocol.Diagnostic{{Message: "overlay-only error"}})
+		overlayEpoch = impl.diags.current(path)
+		_, overlayVersion, _, _ = impl.docs.state(path)
+		return nil
+	}); err != nil {
+		t.Fatalf("WithText: %v", err)
+	}
+	if _, _, ok := impl.diags.snapshot(path); ok {
+		t.Fatal("overlay diagnostics remained current after restoring base text")
+	}
+
+	scripted := h.runner.server(1)
+	waitFor(t, "overlay change and base restore", func() bool {
+		return scripted.countMethod("textDocument/didChange") == 2
+	})
+	scripted.publishDiagnosticsVersion(uriIn(h.root, path), overlayVersion, []any{map[string]any{
+		"range": map[string]any{
+			"start": map[string]any{"line": 0, "character": 0},
+			"end":   map[string]any{"line": 0, "character": 1},
+		},
+		"message": "late overlay-only error",
+	}})
+	if _, err := scripted.request("workspace/configuration", map[string]any{"items": []any{}}, 5*time.Second); err != nil {
+		t.Fatalf("barrier request after late overlay diagnostics: %v", err)
+	}
+	if _, _, ok := impl.diags.snapshot(path); ok {
+		t.Fatal("late versioned overlay diagnostics were accepted for restored base text")
+	}
+
+	var diskEpoch uint64
+	if err := srv.WithDiskText(ctx, path, "typescript", base, func(_ context.Context, epoch uint64) error {
+		diskEpoch = epoch
+		return nil
+	}); err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+	if diskEpoch <= overlayEpoch {
+		t.Fatalf("same-text disk epoch = %d, want future epoch after invalidated overlay %d", diskEpoch, overlayEpoch)
+	}
+	if got := scripted.countMethod("textDocument/didChange"); got != 2 {
+		t.Fatalf("same-text disk indexing sent didChange; total = %d, want 2 from overlay and restore", got)
+	}
+}
+
+func TestWithDiskTextSameTextDifferentLanguageDoesNotReuseDiagnostics(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	const (
+		path = "a.ts"
+		text = "export const value = 'disk';"
+	)
+	if _, err := srv.Open(ctx, path, "typescript", text); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	scripted := h.runner.server(1)
+	waitFor(t, "initial didOpen", func() bool {
+		return scripted.countMethod("textDocument/didOpen") == 1
+	})
+
+	impl := srv.(*server)
+	impl.diags.publish(path, nil)
+	staleEpoch := impl.diags.current(path)
+
+	var callbackEpoch uint64
+	if err := srv.WithDiskText(ctx, path, "typescriptreact", text, func(_ context.Context, epoch uint64) error {
+		callbackEpoch = epoch
+		return nil
+	}); err != nil {
+		t.Fatalf("WithDiskText: %v", err)
+	}
+	if callbackEpoch <= staleEpoch {
+		t.Fatalf("callback epoch = %d, want a future epoch after incompatible-language diagnostics %d", callbackEpoch, staleEpoch)
+	}
+	waitFor(t, "change and restore for incompatible language", func() bool {
+		return scripted.countMethod("textDocument/didChange") == 2
+	})
+}
+
+func TestWithDiskTextRestoresAfterAFailedCallback(t *testing.T) {
+	h, srv := acquire(t, nil, nil)
+	ctx := testContext(t)
+
+	wantErr := protocol.NewError(protocol.ErrInternal, "index callback exploded")
+	err := srv.WithDiskText(ctx, "a.ts", "typescript", "disk", func(context.Context, uint64) error {
+		return wantErr
+	})
+	if err != wantErr {
+		t.Fatalf("WithDiskText error = %v, want callback error %v", err, wantErr)
+	}
+
+	scripted := h.runner.server(1)
+	waitFor(t, "didClose after failed callback", func() bool {
+		return scripted.countMethod("textDocument/didClose") == 1
+	})
+	text, _, languageID, open := h.docsFor(srv).state("a.ts")
+	if open || text != "" || languageID != "" {
+		t.Fatalf("after failed callback state = (%q, %q, %v), want original closed state", text, languageID, open)
+	}
+}
+
+func TestWithDiskTextCallbackCanAskForDiagnostics(t *testing.T) {
+	h, srv := acquire(t, nil, func(o *Options) {
+		o.SettleQuiet = 100 * time.Millisecond
+		o.SettleBudget = time.Second
+	})
+	ctx := testContext(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.WithDiskText(ctx, "a.ts", "typescript", "const x: string = 1;", func(inner context.Context, epoch uint64) error {
+			diags, _, err := srv.Diagnostics(inner, "a.ts", epoch)
+			if err != nil {
+				return err
+			}
+			if len(diags) != 1 {
+				t.Errorf("got %d diagnostics while indexing, want 1", len(diags))
+			}
+			return nil
+		})
+	}()
+
+	scripted := h.runner.server(1)
+	waitFor(t, "index didOpen", func() bool {
+		return scripted.sawMethod("textDocument/didOpen")
+	})
+	scripted.publishDiagnostics(uriIn(h.root, "a.ts"), []any{map[string]any{
+		"range":    map[string]any{"start": map[string]any{"line": 0, "character": 6}, "end": map[string]any{"line": 0, "character": 7}},
+		"severity": 1, "code": 2322, "source": "typescript",
+		"message": "Type 'number' is not assignable to type 'string'.",
+	}})
+	advanceUntil(t, h.clock, time.Second, 25*time.Millisecond, func() bool { return len(done) > 0 })
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WithDiskText: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("index diagnostics deadlocked against the document lock")
+	}
+	waitFor(t, "didClose after index diagnostics", func() bool {
+		return scripted.countMethod("textDocument/didClose") == 1
+	})
 }
 
 // ---- diagnostics through the Server surface ----
@@ -636,4 +1096,29 @@ func TestDiagnosticsForADependencyFileAreDropped(t *testing.T) {
 // this; production code has no reason to.
 func (h *harness) docsFor(srv Server) *documents {
 	return srv.(*server).docs
+}
+
+func notificationDocumentTexts(t *testing.T, srv *scriptedServer, method string) []string {
+	t.Helper()
+	params := srv.notificationParams(method)
+	out := make([]string, 0, len(params))
+	for _, raw := range params {
+		var payload struct {
+			TextDocument struct {
+				Text string `json:"text"`
+			} `json:"textDocument"`
+			ContentChanges []struct {
+				Text string `json:"text"`
+			} `json:"contentChanges"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("decode %s params: %v", method, err)
+		}
+		if len(payload.ContentChanges) > 0 {
+			out = append(out, payload.ContentChanges[0].Text)
+			continue
+		}
+		out = append(out, payload.TextDocument.Text)
+	}
+	return out
 }

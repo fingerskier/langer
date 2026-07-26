@@ -171,6 +171,10 @@ type IndexStatusResult struct {
 	FilesTotal        int            `json:"files_total"`
 	LanguageServers   []ServerStatus `json:"language_servers,omitempty"`
 	LastIndexedUnixMS int64          `json:"last_indexed_unix_ms,omitempty"`
+	// Error is present if and only if State is IndexFailed. Background
+	// indexing failures remain structured SPEC §3.6 errors rather than being
+	// disguised as an empty or ready result.
+	Error *Error `json:"error,omitempty"`
 }
 
 // HandshakeResult tells a client which daemon it reached.

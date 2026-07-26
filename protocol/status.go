@@ -10,6 +10,7 @@ const (
 	IndexScanning IndexState = "scanning"
 	IndexIndexing IndexState = "indexing"
 	IndexReady    IndexState = "ready"
+	IndexFailed   IndexState = "failed"
 )
 
 // ServerState is the SPEC §3.3 language server supervision state machine:

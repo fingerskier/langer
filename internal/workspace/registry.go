@@ -13,16 +13,17 @@ package workspace
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/fingerskier/langer/config"
+	"github.com/fingerskier/langer/index"
 	"github.com/fingerskier/langer/internal/clock"
 	"github.com/fingerskier/langer/internal/procx"
+	"github.com/fingerskier/langer/internal/watch"
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/protocol"
 )
@@ -34,12 +35,16 @@ import (
 // one language server per language per repo). It defaults to lsp.NewSupervisor;
 // tests substitute it, exactly as the M3 NewScanner seam will.
 type RegistryOptions struct {
-	Config        *config.Config
-	Clock         clock.Clock
-	Logger        *slog.Logger
-	Resolver      procx.Resolver
-	Runner        procx.Runner
-	NewSupervisor func(lsp.Options) (lsp.Supervisor, error)
+	Config         *config.Config
+	Store          index.Store
+	Clock          clock.Clock
+	Logger         *slog.Logger
+	Resolver       procx.Resolver
+	Runner         procx.Runner
+	NewScanner     func(procx.Resolver, procx.Runner) watch.Scanner
+	NewWatcher     func(root string, sc watch.Scanner, ck clock.Clock, debounce time.Duration) (watch.Watcher, error)
+	OnFileActivity func()
+	NewSupervisor  func(lsp.Options) (lsp.Supervisor, error)
 }
 
 func (o *RegistryOptions) applyDefaults() {
@@ -57,6 +62,12 @@ func (o *RegistryOptions) applyDefaults() {
 	}
 	if o.Runner == nil {
 		o.Runner = procx.NewRunner()
+	}
+	if o.NewScanner == nil {
+		o.NewScanner = watch.NewScanner
+	}
+	if o.NewWatcher == nil {
+		o.NewWatcher = watch.NewWatcher
 	}
 	if o.NewSupervisor == nil {
 		o.NewSupervisor = lsp.NewSupervisor
@@ -84,8 +95,7 @@ func NewRegistry(opts RegistryOptions) *Registry {
 // remembers an id from a previous daemon generation is not silently talking
 // about a different workspace.
 func WorkspaceIDFor(root string) protocol.WorkspaceID {
-	sum := sha256.Sum256([]byte(root))
-	return protocol.WorkspaceID("ws-" + hex.EncodeToString(sum[:])[:12])
+	return protocol.WorkspaceIDForRoot(root)
 }
 
 // Open opens (or joins) the workspace rooted at root. Roots are identified by
@@ -98,33 +108,23 @@ func (r *Registry) Open(ctx context.Context, root string) (protocol.WorkspaceID,
 	}
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closing {
-		r.mu.Unlock()
 		return "", protocol.NewError(protocol.ErrNotReady, "daemon is shutting down").WithRetryAfterMS(500)
 	}
 	id := WorkspaceIDFor(canonical)
 	if _, ok := r.byID[id]; ok {
-		r.mu.Unlock()
 		return id, nil
 	}
-	r.mu.Unlock()
 
-	ws, err := newWorkspace(id, canonical, r.opts)
+	// Construction starts the watcher and index actors. Keep it inside the
+	// registry critical section so concurrent first opens cannot create two
+	// independent actors mutating the same workspace rows. A daemon serves one
+	// canonical root, so serializing this rare path has no cross-root cost in
+	// production.
+	ws, err := newWorkspace(ctx, id, canonical, r.opts)
 	if err != nil {
 		return "", err
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closing {
-		go func() { _ = ws.shutdown(context.WithoutCancel(ctx)) }()
-		return "", protocol.NewError(protocol.ErrNotReady, "daemon is shutting down").WithRetryAfterMS(500)
-	}
-	// Another caller may have won the race while we built ours; theirs wins and
-	// ours is torn down rather than leaking a supervisor.
-	if existing, ok := r.byID[id]; ok {
-		go func() { _ = ws.shutdown(context.WithoutCancel(ctx)) }()
-		return existing.ID(), nil
 	}
 	r.byID[id] = ws
 	return id, nil

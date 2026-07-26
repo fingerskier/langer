@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/internal/clock"
@@ -23,12 +24,13 @@ import (
 // layer below them is M1's, and daemon/ exercises the real one end to end.
 
 type fakeSupervisor struct {
-	mu         sync.Mutex
-	server     *fakeServer
-	acquireErr error
-	acquires   []string
-	status     []protocol.ServerStatus
-	shutdowns  int
+	mu           sync.Mutex
+	server       *fakeServer
+	acquireErr   error
+	acquires     []string
+	status       []protocol.ServerStatus
+	shutdowns    int
+	shutdownHook func()
 }
 
 func (f *fakeSupervisor) Acquire(_ context.Context, languageID string) (lsp.Server, error) {
@@ -49,8 +51,12 @@ func (f *fakeSupervisor) Status() []protocol.ServerStatus {
 
 func (f *fakeSupervisor) Shutdown(context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.shutdowns++
+	hook := f.shutdownHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
@@ -69,16 +75,26 @@ type fakeServer struct {
 	generation  uint64
 	unsupported map[string]bool
 
-	locations []protocol.Location
-	hover     *protocol.Hover
-	symbols   []protocol.Symbol
-	diags     []protocol.Diagnostic
-	stale     bool
-	edits     []protocol.FileEdit
-	queryErr  error
-	settles   []string
+	locations          []protocol.Location
+	locationsByPath    map[string][]protocol.Location
+	referenceCalls     int
+	hover              *protocol.Hover
+	symbols            []protocol.Symbol
+	indexSymbols       []lsp.IndexSymbol
+	indexSymbolsByPath map[string][]lsp.IndexSymbol
+	diags              []protocol.Diagnostic
+	stale              bool
+	edits              []protocol.FileEdit
+	queryErr           error
+	settles            []string
 
-	withTextSeen []string
+	withTextSeen        []string
+	withDiskSeen        []string
+	documentSymbolCalls int
+	indexStarted        chan struct{}
+	indexRelease        <-chan struct{}
+	referenceStarted    chan struct{}
+	referenceRelease    <-chan struct{}
 }
 
 func newFakeServer() *fakeServer {
@@ -136,16 +152,58 @@ func (f *fakeServer) WithText(ctx context.Context, path, text string, fn func(co
 	return err
 }
 
+func (f *fakeServer) WithDiskText(ctx context.Context, path, _ string, text string, fn func(context.Context, uint64) error) error {
+	f.mu.Lock()
+	if f.queryErr != nil {
+		err := f.queryErr
+		f.mu.Unlock()
+		return err
+	}
+	base, wasOpen := f.open[path]
+	f.open[path] = text
+	f.withDiskSeen = append(f.withDiskSeen, text)
+	f.mu.Unlock()
+
+	err := fn(ctx, 101)
+
+	f.mu.Lock()
+	if wasOpen {
+		f.open[path] = base
+	} else {
+		delete(f.open, path)
+	}
+	f.mu.Unlock()
+	return err
+}
+
 func (f *fakeServer) Definition(context.Context, string, protocol.Position) ([]protocol.Location, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.locations, f.queryErr
 }
 
-func (f *fakeServer) References(context.Context, string, protocol.Position, bool) ([]protocol.Location, error) {
+func (f *fakeServer) References(_ context.Context, path string, _ protocol.Position, _ bool) ([]protocol.Location, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.locations, f.queryErr
+	f.referenceCalls++
+	locations := f.locations
+	if f.locationsByPath != nil {
+		locations = f.locationsByPath[path]
+	}
+	locations = append([]protocol.Location(nil), locations...)
+	err := f.queryErr
+	started := f.referenceStarted
+	release := f.referenceRelease
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	return locations, err
 }
 
 func (f *fakeServer) Hover(context.Context, string, protocol.Position) (*protocol.Hover, error) {
@@ -157,7 +215,42 @@ func (f *fakeServer) Hover(context.Context, string, protocol.Position) (*protoco
 func (f *fakeServer) DocumentSymbols(context.Context, string) ([]protocol.Symbol, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.documentSymbolCalls++
 	return f.symbols, f.queryErr
+}
+
+func (f *fakeServer) DocumentSymbolsForIndex(_ context.Context, path string) ([]lsp.IndexSymbol, error) {
+	f.mu.Lock()
+	f.documentSymbolCalls++
+	started := f.indexStarted
+	release := f.indexRelease
+	indexSymbols := append([]lsp.IndexSymbol(nil), f.indexSymbols...)
+	if byPath, ok := f.indexSymbolsByPath[path]; ok {
+		indexSymbols = make([]lsp.IndexSymbol, len(byPath))
+		copy(indexSymbols, byPath)
+	}
+	symbols := append([]protocol.Symbol(nil), f.symbols...)
+	err := f.queryErr
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	if indexSymbols != nil {
+		return indexSymbols, err
+	}
+	out := make([]lsp.IndexSymbol, 0, len(f.symbols))
+	for _, symbol := range symbols {
+		out = append(out, lsp.IndexSymbol{
+			Symbol: symbol, SelectionRange: symbol.Range, HasSelectionRange: true,
+		})
+	}
+	return out, err
 }
 
 func (f *fakeServer) WorkspaceSymbols(context.Context, string, int) ([]protocol.Symbol, error) {
@@ -308,6 +401,60 @@ func TestRegistryOpenIsIdempotentPerRoot(t *testing.T) {
 	}
 }
 
+func TestConcurrentRegistryOpenBuildsOneWorkspaceActor(t *testing.T) {
+	root, err := CanonicalRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	reg := NewRegistry(RegistryOptions{
+		Config: &config.Config{LogLevel: "info"},
+		Clock:  clock.NewFake(clock.New().Now()),
+		NewSupervisor: func(lsp.Options) (lsp.Supervisor, error) {
+			started <- struct{}{}
+			<-release
+			return &fakeSupervisor{server: newFakeServer()}, nil
+		},
+	})
+	t.Cleanup(func() { _ = reg.Shutdown(context.Background()) })
+
+	type result struct {
+		id  protocol.WorkspaceID
+		err error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			id, err := reg.Open(context.Background(), root)
+			results <- result{id: id, err: err}
+		}()
+	}
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("first workspace construction did not start")
+	}
+	select {
+	case <-started:
+		close(release)
+		t.Fatal("concurrent Open constructed a duplicate workspace actor")
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+	}
+
+	first := <-results
+	second := <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent Open errors = %v, %v", first.err, second.err)
+	}
+	if first.id == "" || first.id != second.id {
+		t.Fatalf("concurrent Open ids = %q, %q", first.id, second.id)
+	}
+}
+
 func TestRegistryGetUnknownWorkspace(t *testing.T) {
 	h := newHarness(t)
 	_, err := h.reg.Get("ws-does-not-exist")
@@ -335,6 +482,21 @@ func TestPathEscapingTheRootIsWorkspaceUnknown(t *testing.T) {
 			wantCode(t, err, protocol.ErrWorkspaceUnknown)
 		})
 	}
+}
+
+func TestSymlinkInsideWorkspaceCannotEscapeRoot(t *testing.T) {
+	h := newHarness(t)
+	outside := filepath.Join(t.TempDir(), "secret.ts")
+	if err := os.WriteFile(outside, []byte("export const secret = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(h.root, "src", "escape.ts")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	_, err := h.ws.Definition(context.Background(), sess, "src/escape.ts", protocol.Position{})
+	wantCode(t, err, protocol.ErrWorkspaceUnknown)
 }
 
 func TestMissingFileIsWorkspaceUnknown(t *testing.T) {

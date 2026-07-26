@@ -1,8 +1,8 @@
 # LSP-MCP Bridge — Technical Specification
 
-**Version:** 0.3  
-**Status:** Ready for implementation  
-**Date:** 2026-07-24  
+**Version:** 0.4
+**Status:** Ready for implementation
+**Date:** 2026-07-25
 **Companion:** `PLAN.md` (milestone execution plan)
 **Related systems:** Claude Code, GrokBuild, Codex, OpenClaw
 
@@ -81,8 +81,11 @@ The daemon is the source of truth for all semantic data. The MCP server is a pur
   1. Open/create the SQLite database.
   2. Load language server registry.
   3. Restore known workspaces from the database.
-  4. Start file watchers for active workspaces.
-  5. Lazily start language servers only when needed.
+  4. Start file watchers for active workspaces **before** any initial or
+     resumed scan. Watcher batches invalidate affected cache rows
+     synchronously before re-index work is queued.
+  5. Resume or start indexing.
+  6. Lazily start language servers only when needed.
 
 ### 3.2 Multi-Repo Model
 
@@ -90,14 +93,27 @@ The daemon is the source of truth for all semantic data. The MCP server is a pur
 repo, one MCP server process per agent/client.** Multiple MCP clients may
 still attach to the same workspace daemon.
 
-- Each workspace is identified by its absolute root path.
+- Each workspace is identified by its **canonical absolute root path**. The
+  CLI supplies that root (normally its current working directory); deeper
+  layers do not consult a potentially drifted process cwd.
+- Each workspace also records a portable `repo_namespace` used in cached
+  symbol identity. It is the normalized path slug from the system-Git
+  `origin` URL (normally `<org>/<name>`; deeper namespace segments are
+  preserved). Transport, user, host, leading/trailing slashes, and a trailing
+  `.git` are removed. No network lookup occurs. A missing/unusable origin,
+  non-Git root, or unavailable system Git falls back to the same canonical
+  absolute workspace root.
+- `repo_namespace` is metadata, **not** the workspace identity. Workspace IDs
+  remain derived from canonical absolute roots, and every index query includes
+  `workspace_id`, so clones and worktrees sharing one origin never share rows.
 - Index data for all workspaces lives in a single user-level SQLite database.
   **Concurrency model (decided): no dedicated DB daemon.** Each per-repo
   daemon opens the database directly in WAL mode with a `busy_timeout`;
   readers never block, writers queue briefly at the file level. Write
-  transactions are kept short (batched per file re-index). GC / `VACUUM` /
-  schema migrations are run by whichever daemon notices they are due,
-  guarded by an advisory lock in the `meta` table. All access goes through
+  transactions are kept short (batched per file re-index). GC and schema
+  migrations are run by whichever daemon notices they are due, guarded by an
+  advisory lock in the `meta` table. `VACUUM` is restricted to the shutdown
+  checkpoint policy in §3.4. All access goes through
   a single shared driver module — the seam where a write-broker process
   could be inserted later if measured contention ever demands it.
 - Optional per-project databases are supported but not required for v0.1.
@@ -108,14 +124,33 @@ still attach to the same workspace daemon.
 - Configuration is declarative (name, command, args, file extensions, root markers).
 - The daemon monitors language server health and restarts on crash with exponential backoff.
 - Only one instance of a given language server is kept per workspace (or shared when safe).
+- A replacement language-server session is not published as ready until its
+  prior open documents have been resynchronized. Resynchronization acquires
+  each per-document lock and re-reads that document's current state after
+  acquiring it, so an in-flight disk-index or speculative view cannot leak
+  into the replacement process.
 
 ### 3.4 Indexing Behavior
 
 - On first open of a workspace: full index (or resume from previous state).
-- Subsequent changes: incremental via file watcher + content-hash comparison.
+- The watcher is running before the first scan. Subsequent changes are
+  incremental via watcher + content-hash comparison. A non-empty watcher batch
+  counts as daemon file activity and resets the idle-sunset period.
+- The watcher installs recursive watches before taking its initial
+  `Scanner.List` scope snapshot. On every debounced raw-event flush it reruns
+  that same authoritative list and diffs it against the prior snapshot.
+  Consequently ignored writes are discarded and an in-tree `.gitignore` edit
+  produces deletions for newly ignored files and changes for newly admitted
+  files. Every flush also observes the current `.git/info/exclude` and global
+  Git-exclude rules, although those external/denied files are not themselves
+  watched.
 - **Scope: project files only.** Dependency directories (`node_modules`,
   `vendor`, `target`, virtualenvs, etc.) and `.gitignore`d paths are excluded
-  from indexing. Language servers may still resolve into them for live queries.
+  from indexing, including tracked files beneath a denied dependency
+  directory. The scanner invokes only a system `git` resolved through the same
+  workspace-local-executable guard used for language servers, and falls back
+  to a filesystem walk. Language servers may still resolve into dependencies
+  for live queries.
 - Index stores: files, symbols, references, diagnostics, and basic hierarchy edges.
 - **Staleness = file changed underneath.** A file's index entries are stale
   when its current content hash differs from `files.content_hash`. On any
@@ -123,8 +158,37 @@ still attach to the same workspace daemon.
   symbols/references/diagnostics immediately and re-queries the language
   server; queries touching a stale file are answered live from the language
   server, never from the stale cache.
-- The single shared database may grow large; a periodic GC pass removes rows
-  for deleted files, dead workspaces, and expired diagnostics.
+- Indexing always reads text from disk, never from a speculative overlay. The
+  complete read → LSP query → commit sequence runs under the same per-document
+  serialization used by live and speculative operations. The indexer hashes
+  the disk bytes before querying, re-hashes immediately before commit, and
+  discards/reschedules the result if the hash or watcher generation changed.
+  A change after that check remains safe because every cache read rechecks the
+  disk hash.
+- A per-file cache answer is usable only while its stored hash matches disk.
+  Workspace-wide answers (`workspace_symbols`, workspace diagnostics, or a
+  cached reference set) are returned only when the relevant initial scan and
+  replacement transaction are complete; otherwise the daemon returns
+  `NOT_READY`, never a partial success.
+- Cache invalidation is self-healing. For a current regular file, a per-file
+  cache miss or `NOT_READY` answer invalidates and queues that path, then
+  serves the current query live. A workspace-wide `NOT_READY` answer or
+  degraded `index_status` starts a coalesced background pass over the
+  workspace's known paths; the workspace-wide caller still receives
+  `NOT_READY` until the pass completes.
+- `index_status` has an explicit `failed` state. A failed status carries the
+  structured §3.6 error that stopped the scan; failure is never encoded as a
+  free-text state or mistaken for `ready`.
+- The single shared database may grow between GC passes. A daemon attempts GC
+  hourly under a 60-second expiring lease renewed every 20 seconds. The
+  seven-day diagnostic retention boundary invalidates the entire atomic
+  per-file semantic snapshot, including files whose recorded diagnostic set
+  was empty: affected reference sets become incomplete, symbols and
+  diagnostics are removed, and the file hash is cleared. Reads therefore
+  return `NOT_READY` or use the per-file live fallback until the healing pass
+  reindexes the snapshot. A workspace whose root remains missing is retained
+  for 30 days before pruning. `VACUUM` runs only during a shutdown checkpoint
+  and only when reclaimable pages exceed 25% of the database.
 
 ### 3.5 Daemon API (Internal)
 
@@ -334,7 +398,8 @@ The daemon maintains a single primary SQLite database.
 schema_version (version)
 
 workspaces (
-  id, root_path, name, created_at, last_indexed
+  id, root_path, repo_namespace, name,
+  created_at, last_indexed, missing_since
 )
 
 files (
@@ -345,14 +410,26 @@ files (
 symbols (
   id, file_id, name, kind, detail,
   start_line, start_col, end_line, end_col,
+  selection_start_line, selection_start_col,
+  selection_end_line, selection_end_col,
   container_name, documentation,
-  stable_key  -- name + container_name + kind: survives re-index
+  stable_key, -- name + container_name + kind; descriptive, not unique
+  symbol_key  -- repo_namespace + definition path + stable_key
 )
 
-references (
-  id, symbol_stable_key, file_id,   -- keyed by stable_key, not symbol row id
+reference_sets (
+  workspace_id, symbol_key, complete, updated_at_unix_ms,
+  PRIMARY KEY (workspace_id, symbol_key),
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+)
+
+"references" (
+  id, workspace_id, symbol_key, ordinal, path,
   start_line, start_col, end_line, end_col,
-  is_definition
+  is_definition,
+  FOREIGN KEY (workspace_id, symbol_key)
+    REFERENCES reference_sets(workspace_id, symbol_key) ON DELETE CASCADE,
+  UNIQUE (workspace_id, symbol_key, ordinal)
 )
 
 diagnostics (
@@ -369,13 +446,49 @@ call_edges (from_symbol, to_symbol)
 ### 5.2 Indexing Strategy
 
 - Content hash (SHA-256) used for change detection.
+- Cached `workspace_symbols` search is case-insensitive and Unicode-aware.
+  For a non-empty query, matches rank exact, prefix, contiguous substring,
+  word-boundary subsequence, then general subsequence. Fewer gaps, earlier
+  starts, and shorter names win within a class; remaining ties are
+  deterministic. The result limit is applied only after fuzzy filtering and
+  ranking. An empty query returns all symbols in deterministic order.
+- `stable_key = name + U+001F + container_name + U+001F + kind`. It survives
+  a row replacement but is intentionally **non-unique metadata**.
+- Cached-reference identity is
+  `symbol_key = repo_namespace + U+001F + workspace-relative definition path
+  + U+001F + stable_key`. Definition paths use the same canonical,
+  slash-separated workspace-relative representation as tool results.
+- `symbol_key` does not replace workspace scoping: reads and writes always
+  include `workspace_id`. If more than one candidate in a workspace/file still
+  has the same key, the cache is ambiguous and `get_references` falls back to
+  the live language server.
+- The internal index symbol retains the LSP `selectionRange` and an explicit
+  `HasSelectionRange` validity bit even though the public §4.4 `Symbol` shape
+  stays unchanged. The bit is true only for an explicit `selectionRange` on a
+  `DocumentSymbol`. A `SymbolInformation` response has only
+  `location.range`, and a malformed `DocumentSymbol` may omit
+  `selectionRange`; their fallback range may be stored for symbol lookup but
+  is not trusted for reference discovery. The indexer issues cached reference
+  discovery at `selectionRange.start` only when the bit is true, so these
+  fallback cases have no cached reference set and go live.
 - On file change: immediately delete that file's cached symbols, references,
   and diagnostics (cache-kill-on-change), then re-query the language server
-  and insert fresh data. Cross-file references survive because they are keyed
-  by `stable_key` (name + container + kind), not by the deleted symbol rows.
+  and insert fresh data.
+- File metadata, symbols, and diagnostics are replaced atomically per file.
+  A full cross-file reference set is owned separately and replaced atomically
+  by `(workspace_id, symbol_key)`; a per-file write never partially overwrites
+  another file's reference contribution. Unless a watcher invalidated it, the
+  old complete set remains visible until the new complete set commits; an
+  invalidated/incomplete set returns `NOT_READY`, never partial locations.
+  Reference locations store a workspace-relative `path` and an `ordinal`
+  within the complete set, not a `files.id`.
+- After the watcher is ready, each initial `Scanner.List` result is passed to
+  `ReconcileWorkspace` before resume/index work begins. Reconciliation removes
+  persisted file rows and reference locations absent from that authoritative
+  scope and marks every affected reference set incomplete.
 - Diagnostics are refreshed more aggressively (on open / after edit).
-- Periodic GC: prune rows for deleted files and stale workspaces; `VACUUM`
-  opportunistically. Unbounded DB growth is acceptable between GC passes.
+- Periodic GC uses the timing and retention policy in §3.4. Unbounded DB
+  growth is acceptable between passes.
 
 ---
 
@@ -477,6 +590,8 @@ server per agent. Defer HTTP transport, per-project DBs, and extra subcommands.
 - Claude Code and GrokBuild can both use the same MCP server entry.
 - Speculative edit returns accurate diagnostics without writing to disk.
 - Daemon auto-starts on first MCP connect and sunsets after idle timeout.
+- The binary and local daemon transport work on Windows as well as Unix-like
+  systems; language-server process trees are cleaned up on both.
 
 ### 11.1 Testing Strategy
 
@@ -485,8 +600,10 @@ server per agent. Defer HTTP transport, per-project DBs, and extra subcommands.
 - TDD for security invariants — in particular a test proving that opening a
   workspace containing a project-local language server binary
   (`node_modules/.bin/...`) never executes it.
-- Unit tests for the index layer (staleness/invalidation, stable_key reference
-  survival across re-index, GC) and the error model (each §3.6 code reachable).
+- Unit tests for the index layer (staleness/invalidation, origin-slug and cwd
+  namespace fallback, `stable_key` collision isolation, `symbol_key` reference
+  survival and atomic replacement, failed status, GC lease/retention) and the
+  error model (each §3.6 code reachable).
 
 ---
 

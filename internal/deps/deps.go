@@ -4,9 +4,6 @@
 // M0 owns go.mod; M1–M6 should never have to touch it. Each import below is
 // claimed by a specific milestone:
 //
-//	modernc.org/sqlite                       M3 — pure-Go SQLite driver (no cgo,
-//	                                         keeps the single-binary goal)
-//	github.com/fsnotify/fsnotify             M3 — workspace file watcher
 //	github.com/modelcontextprotocol/go-sdk   M4 — MCP server over stdio
 //
 // The TOML decoder and go-cmp are already used directly (config, tests) and so
@@ -17,7 +14,5 @@
 package deps
 
 import (
-	_ "github.com/fsnotify/fsnotify"
 	_ "github.com/modelcontextprotocol/go-sdk/mcp"
-	_ "modernc.org/sqlite"
 )

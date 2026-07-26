@@ -4,6 +4,8 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -72,14 +74,25 @@ func (r *recordingRunner) waitForStart(n int) bool {
 func startRealDaemon(t *testing.T) (*harness, *recordingRunner) {
 	t.Helper()
 
-	entry := testutil.RequireLanguageServer(t, "typescript")
 	root, err := filepath.EvalSymlinks(testutil.FixtureRoot(t, "ts-project"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	h, runner, _ := startRealDaemonForRoot(t, root, "")
+	return h, runner
+}
+
+func startRealDaemonForRoot(
+	t *testing.T,
+	root, databasePath string,
+) (*harness, *recordingRunner, func()) {
+	t.Helper()
+
+	entry := testutil.RequireLanguageServer(t, "typescript")
 
 	cfg := &config.Config{
 		SocketPath:      filepath.Join(shortTempDir(t), "daemon.sock"),
+		DatabasePath:    databasePath,
 		LogLevel:        "error",
 		LanguageServers: []config.LanguageServer{entry},
 	}
@@ -105,12 +118,16 @@ func startRealDaemon(t *testing.T) (*harness, *recordingRunner) {
 		h.exitErr = srv.Run(ctx)
 		close(h.done)
 	}()
-	t.Cleanup(func() {
-		cancel()
-		if _, ok := h.waitExit(60 * time.Second); !ok {
-			t.Error("the daemon did not shut down")
-		}
-	})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			if _, ok := h.waitExit(60 * time.Second); !ok {
+				t.Error("the daemon did not shut down")
+			}
+		})
+	}
+	t.Cleanup(stop)
 
 	select {
 	case <-srv.Ready():
@@ -119,7 +136,7 @@ func startRealDaemon(t *testing.T) (*harness, *recordingRunner) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the daemon never became ready")
 	}
-	return h, runner
+	return h, runner, stop
 }
 
 func realContext(t *testing.T) context.Context {
@@ -127,6 +144,212 @@ func realContext(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func waitForRealIndexReady(
+	t *testing.T,
+	client *daemonctl.Client,
+	session protocol.SessionID,
+	workspace protocol.WorkspaceID,
+) protocol.IndexStatusResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	var last protocol.IndexStatusResult
+	for ctx.Err() == nil {
+		status, err := client.IndexStatus(ctx, protocol.IndexStatusParams{
+			Session: session, Workspace: workspace,
+		})
+		if err != nil {
+			t.Fatalf("index_status: %v", err)
+		}
+		last = status
+		switch status.State {
+		case protocol.IndexReady:
+			return status
+		case protocol.IndexFailed:
+			t.Fatalf("index failed: %+v", status.Error)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("index did not become ready: %+v", last)
+	return protocol.IndexStatusResult{}
+}
+
+func hasNamedSymbol(symbols []protocol.Symbol, name string) bool {
+	for _, symbol := range symbols {
+		if symbol.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func copyRealFixture(t *testing.T, name string) string {
+	t.Helper()
+	root := filepath.Join(shortTempDir(t), name)
+	if err := os.CopyFS(root, os.DirFS(testutil.FixtureRoot(t, name))); err != nil {
+		t.Fatalf("copying %s fixture: %v", name, err)
+	}
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
+}
+
+// TestRealIndexReflectsEditAndSurvivesDaemonRestart is PLAN M3's persistence
+// acceptance test against the real TypeScript language server. The second
+// daemon must answer both symbol APIs from SQLite without starting a language
+// server at all.
+func TestRealIndexReflectsEditAndSurvivesDaemonRestart(t *testing.T) {
+	const probe = "restartCacheProbe"
+	root := copyRealFixture(t, "ts-project")
+	databasePath := filepath.Join(shortTempDir(t), "index.db")
+
+	first, firstRunner, stopFirst := startRealDaemonForRoot(t, root, databasePath)
+	firstClient, firstWorkspace := first.session("before-restart")
+	initial := waitForRealIndexReady(t, firstClient, "before-restart", firstWorkspace)
+	if initial.FilesTotal == 0 || initial.FilesIndexed != initial.FilesTotal {
+		t.Fatalf("initial index status = %+v, want a complete non-empty index", initial)
+	}
+	if len(firstRunner.started()) == 0 {
+		t.Fatal("initial indexing never started the real language server")
+	}
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	indexedAt := func(path string) (int64, error) {
+		var at int64
+		err := db.QueryRowContext(
+			context.Background(),
+			`SELECT last_indexed_unix_ms
+			 FROM files
+			 WHERE workspace_id = ? AND path = ?`,
+			firstWorkspace,
+			path,
+		).Scan(&at)
+		return at, err
+	}
+	beforeUserIndexedAt, err := indexedAt("src/user.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeUnchangedIndexedAt, err := indexedAt("src/unicode.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userPath := filepath.Join(root, "src", "user.ts")
+	before, err := os.ReadFile(userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := append(append([]byte(nil), before...), []byte("\nexport const "+probe+" = 1;\n")...)
+	if err := os.WriteFile(userPath, edited, info.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	var (
+		lastStatus        protocol.IndexStatusResult
+		lastUserIndexedAt int64
+		stableSince       time.Time
+	)
+	for ctx.Err() == nil {
+		status, statusErr := firstClient.IndexStatus(ctx, protocol.IndexStatusParams{
+			Session: "before-restart", Workspace: firstWorkspace,
+		})
+		if statusErr != nil {
+			t.Fatalf("index_status after edit: %v", statusErr)
+		}
+		lastStatus = status
+		userIndexedAt, err := indexedAt("src/user.ts")
+		if err != nil {
+			t.Fatalf("reading edited index timestamp: %v", err)
+		}
+		lastUserIndexedAt = userIndexedAt
+		unchangedIndexedAt, err := indexedAt("src/unicode.ts")
+		if err != nil {
+			t.Fatalf("reading unchanged index timestamp: %v", err)
+		}
+		if unchangedIndexedAt != beforeUnchangedIndexedAt {
+			t.Fatalf("edit triggered a full re-index: src/unicode.ts timestamp changed %d -> %d",
+				beforeUnchangedIndexedAt, unchangedIndexedAt)
+		}
+
+		// No semantic file query occurs before this condition. The timestamp
+		// transition therefore proves the watcher, rather than query-driven
+		// hash healing, observed and incrementally reindexed the edit.
+		if status.State == protocol.IndexReady && userIndexedAt > beforeUserIndexedAt {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			} else if time.Since(stableSince) >= 500*time.Millisecond {
+				break
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("edited file never reached a stable incremental index: status=%+v timestamp=%d (before %d)",
+			lastStatus, lastUserIndexedAt, beforeUserIndexedAt)
+	}
+	editedDocument, err := firstClient.DocumentSymbols(realContext(t), protocol.DocumentParams{
+		Session: "before-restart", Workspace: firstWorkspace, Path: "src/user.ts",
+	})
+	if err != nil {
+		t.Fatalf("document_symbols after watcher reindex: %v", err)
+	}
+	if !hasNamedSymbol(editedDocument.Symbols, probe) {
+		t.Fatalf("incremental index missed edited symbol %q: %+v", probe, editedDocument.Symbols)
+	}
+
+	_ = firstClient.Close()
+	stopFirst()
+
+	second, secondRunner, _ := startRealDaemonForRoot(t, root, databasePath)
+	secondClient, secondWorkspace := second.session("after-restart")
+	if secondWorkspace != firstWorkspace {
+		t.Fatalf("workspace id changed across restart: %q -> %q", firstWorkspace, secondWorkspace)
+	}
+	restarted := waitForRealIndexReady(t, secondClient, "after-restart", secondWorkspace)
+	if restarted.FilesIndexed != restarted.FilesTotal || restarted.FilesTotal != initial.FilesTotal {
+		t.Fatalf("restarted index status = %+v, initial = %+v", restarted, initial)
+	}
+	if got := len(secondRunner.started()); got != 0 {
+		t.Fatalf("restart validation started %d language servers before a query, want 0", got)
+	}
+
+	document, err := secondClient.DocumentSymbols(realContext(t), protocol.DocumentParams{
+		Session: "after-restart", Workspace: secondWorkspace, Path: "src/user.ts",
+	})
+	if err != nil {
+		t.Fatalf("cached document_symbols after restart: %v", err)
+	}
+	if !hasNamedSymbol(document.Symbols, probe) {
+		t.Fatalf("cached document symbols after restart missed %q: %+v", probe, document.Symbols)
+	}
+	workspaceSymbols, err := secondClient.WorkspaceSymbols(realContext(t), protocol.WorkspaceSymbolsParams{
+		Session: "after-restart", Workspace: secondWorkspace, Query: probe, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("cached workspace_symbols after restart: %v", err)
+	}
+	if !hasNamedSymbol(workspaceSymbols.Symbols, probe) {
+		t.Fatalf("cached workspace symbols after restart missed %q: %+v", probe, workspaceSymbols.Symbols)
+	}
+	if got := len(secondRunner.started()); got != 0 {
+		t.Fatalf("cached restart queries started %d language servers, want 0", got)
+	}
 }
 
 // TestRealDaemonAnswersTwoConcurrentClients is PLAN M2's first acceptance
@@ -306,8 +529,11 @@ func TestKillingARealLanguageServerDoesNotKillTheDaemon(t *testing.T) {
 
 	client, ws := h.session("alice")
 
-	if _, err := client.DocumentSymbols(ctx, protocol.DocumentParams{
-		Session: "alice", Workspace: ws, Path: "src/user.ts",
+	if _, err := client.GetDefinition(ctx, protocol.PositionParams{
+		DocumentParams: protocol.DocumentParams{
+			Session: "alice", Workspace: ws, Path: "src/service.ts",
+		},
+		Position: protocol.Position{Line: 6, Character: 21},
 	}); err != nil {
 		t.Fatalf("the first query failed: %v", err)
 	}
@@ -328,8 +554,11 @@ func TestKillingARealLanguageServerDoesNotKillTheDaemon(t *testing.T) {
 		lastErr       error
 	)
 	for time.Now().Before(deadline) {
-		_, err := client.DocumentSymbols(ctx, protocol.DocumentParams{
-			Session: "alice", Workspace: ws, Path: "src/user.ts",
+		_, err := client.GetDefinition(ctx, protocol.PositionParams{
+			DocumentParams: protocol.DocumentParams{
+				Session: "alice", Workspace: ws, Path: "src/service.ts",
+			},
+			Position: protocol.Position{Line: 6, Character: 21},
 		})
 		if err == nil {
 			recovered = true

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/fingerskier/langer/config"
 	"github.com/fingerskier/langer/lsp"
@@ -54,6 +53,55 @@ func (w *Workspace) relPath(path string) (string, error) {
 
 func (w *Workspace) absPath(rel string) string {
 	return filepath.Join(w.root, filepath.FromSlash(rel))
+}
+
+// validateWorkspaceFile rejects filesystem escape through any symlinked path
+// component. Lstat on only the leaf follows an intermediate symlink and can
+// otherwise read a file outside the workspace.
+func (w *Workspace) validateWorkspaceFile(rel string) error {
+	parts := strings.Split(filepath.Clean(filepath.FromSlash(rel)), string(filepath.Separator))
+	current := w.root
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return protocol.NewErrorf(protocol.ErrWorkspaceUnknown,
+				"%s is not a project file in workspace %s", rel, w.root)
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return protocol.NewErrorf(protocol.ErrWorkspaceUnknown,
+				"%s is not a regular project file in workspace %s", rel, w.root)
+		}
+		if i < len(parts)-1 {
+			if !info.IsDir() {
+				return protocol.NewErrorf(protocol.ErrWorkspaceUnknown,
+					"%s is not a regular project file in workspace %s", rel, w.root)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return protocol.NewErrorf(protocol.ErrWorkspaceUnknown,
+				"%s is not a regular project file in workspace %s", rel, w.root)
+		}
+	}
+	return nil
+}
+
+// cacheEligibleFile reports whether rel belongs to the authoritative
+// project-file snapshot. Safe in-root dependency/ignored files may still be
+// queried live, as SPEC §3.4 permits, but must never enter SQLite or
+// workspace-wide cached answers.
+func (w *Workspace) cacheEligibleFile(rel string) (bool, error) {
+	if err := w.validateWorkspaceFile(rel); err != nil {
+		return false, err
+	}
+	if w.store == nil {
+		return false, nil
+	}
+	w.indexMu.Lock()
+	_, known := w.known[rel]
+	w.indexMu.Unlock()
+	return known, nil
 }
 
 // hasRootMarker reports whether any of an entry's declared root markers exists
@@ -115,19 +163,34 @@ func (w *Workspace) languageIDFor(rel string) string {
 
 // ---- document freshness ----------------------------------------------------
 
-// lockDoc serialises the read/compare/reopen sequence for one path and returns
-// the unlock function.
-func (w *Workspace) lockDoc(rel string) func() {
+type documentLock struct {
+	held chan struct{}
+}
+
+// lockDoc serialises the read/compare/reopen sequence for one path. Unlike a
+// sync.Mutex, the channel leaf lets a request abandon its wait when its context
+// expires without acquiring or leaking the lock.
+func (w *Workspace) lockDoc(ctx context.Context, rel string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, protocol.NewErrorf(protocol.ErrNotReady,
+			"waiting for exclusive access to %s: %v", rel, err).WithRetryAfterMS(200)
+	}
+
 	w.docMu.Lock()
-	mu, ok := w.docLock[rel]
+	leaf, ok := w.docLock[rel]
 	if !ok {
-		mu = &sync.Mutex{}
-		w.docLock[rel] = mu
+		leaf = &documentLock{held: make(chan struct{}, 1)}
+		w.docLock[rel] = leaf
 	}
 	w.docMu.Unlock()
 
-	mu.Lock()
-	return mu.Unlock
+	select {
+	case leaf.held <- struct{}{}:
+		return func() { <-leaf.held }, nil
+	case <-ctx.Done():
+		return nil, protocol.NewErrorf(protocol.ErrNotReady,
+			"waiting for exclusive access to %s: %v", rel, ctx.Err()).WithRetryAfterMS(200)
+	}
 }
 
 // prepare is the common preamble of every positional query: validate the path,
@@ -140,12 +203,18 @@ func (w *Workspace) prepare(ctx context.Context, path string) (lsp.Server, strin
 	if err != nil {
 		return nil, "", 0, err
 	}
+	if _, err := w.cachedFileFresh(ctx, rel); err != nil {
+		return nil, "", 0, err
+	}
 	srv, err := w.serverFor(ctx, rel)
 	if err != nil {
 		return nil, "", 0, err
 	}
 
-	unlock := w.lockDoc(rel)
+	unlock, err := w.lockDoc(ctx, rel)
+	if err != nil {
+		return nil, "", 0, err
+	}
 	defer unlock()
 
 	epoch, err := w.ensureDocumentLocked(ctx, srv, rel, "")
@@ -245,13 +314,17 @@ func (w *Workspace) awaitAnalysis(ctx context.Context, srv lsp.Server, rel strin
 // readDocument reads a workspace file, mapping a missing or unreadable path
 // onto WORKSPACE_UNKNOWN.
 func (w *Workspace) readDocument(rel string) (string, error) {
+	if err := w.validateWorkspaceFile(rel); err != nil {
+		return "", err
+	}
 	abs := w.absPath(rel)
-	info, err := os.Stat(abs)
+	info, err := os.Lstat(abs)
 	if err != nil {
 		return "", protocol.NewErrorf(protocol.ErrWorkspaceUnknown, "%s is not a file in workspace %s", rel, w.root)
 	}
-	if info.IsDir() {
-		return "", protocol.NewErrorf(protocol.ErrWorkspaceUnknown, "%s is a directory, not a file", rel)
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", protocol.NewErrorf(protocol.ErrWorkspaceUnknown,
+			"%s is not a regular, non-symlink file in workspace %s", rel, w.root)
 	}
 	if info.Size() > maxDocumentBytes {
 		return "", protocol.NewErrorf(protocol.ErrUnsupported,
@@ -317,6 +390,13 @@ func hashBytes(data []byte) string {
 // hashFile returns the SHA-256 of a workspace file, or ok=false when it cannot
 // be read — which apply_edit treats exactly like a mismatch.
 func (w *Workspace) hashFile(rel string) (string, bool) {
+	if err := w.validateWorkspaceFile(rel); err != nil {
+		return "", false
+	}
+	info, err := os.Lstat(w.absPath(rel))
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", false
+	}
 	data, err := os.ReadFile(w.absPath(rel))
 	if err != nil {
 		return "", false
@@ -432,9 +512,13 @@ func (w *Workspace) ApplyEdit(ctx context.Context, _ protocol.SessionID, token s
 // and are applied back-to-front so an earlier edit cannot shift a later one's
 // offsets.
 func (w *Workspace) applyFileEdits(ctx context.Context, file protocol.FileEdit) error {
+	if err := w.validateWorkspaceFile(file.Path); err != nil {
+		return protocol.NewErrorf(protocol.ErrStaleEdit,
+			"%s is no longer a safe workspace file", file.Path)
+	}
 	abs := w.absPath(file.Path)
-	info, err := os.Stat(abs)
-	if err != nil {
+	info, err := os.Lstat(abs)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return protocol.NewErrorf(protocol.ErrStaleEdit, "%s no longer exists", file.Path)
 	}
 	data, err := os.ReadFile(abs)
@@ -481,14 +565,23 @@ func (w *Workspace) applyFileEdits(ctx context.Context, file protocol.FileEdit) 
 
 	// The language server is now holding the pre-edit text. Forget our record
 	// so the next query notices and reopens (ensureDocumentLocked).
-	unlock := w.lockDoc(file.Path)
+	cleanupCtx := context.WithoutCancel(ctx)
+	if w.indexCtx != nil {
+		cleanupCtx = w.indexCtx
+	}
+	unlock, err := w.lockDoc(cleanupCtx, file.Path)
+	if err != nil {
+		return err
+	}
 	w.mu.Lock()
 	if st, ok := w.docs[file.Path]; ok {
 		st.text = ""
 	}
 	w.mu.Unlock()
 	unlock()
-	_ = ctx
+	if err := w.invalidateAndQueue(ctx, file.Path, false); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -525,7 +618,7 @@ func (w *Workspace) SimulateEdit(ctx context.Context, _ protocol.SessionID, path
 	// query sees a mismatch, reopens, and settles against a fresh epoch. It is
 	// deliberately done even when fn failed, because the speculative push
 	// happened either way.
-	w.forgetDocument(rel)
+	w.forgetDocument(ctx, rel)
 
 	if err != nil {
 		return nil, false, protocol.AsError(err)
@@ -535,8 +628,16 @@ func (w *Workspace) SimulateEdit(ctx context.Context, _ protocol.SessionID, path
 
 // forgetDocument drops our record of what the server holds for rel, so the next
 // query resynchronises it from disk.
-func (w *Workspace) forgetDocument(rel string) {
-	unlock := w.lockDoc(rel)
+func (w *Workspace) forgetDocument(ctx context.Context, rel string) {
+	cleanupCtx := context.WithoutCancel(ctx)
+	if w.indexCtx != nil {
+		cleanupCtx = w.indexCtx
+	}
+	unlock, err := w.lockDoc(cleanupCtx, rel)
+	if err != nil {
+		w.log.Debug("forgetting document after speculative edit failed", "path", rel, "error", err)
+		return
+	}
 	defer unlock()
 
 	w.mu.Lock()

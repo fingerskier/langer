@@ -37,14 +37,15 @@ type RawHover struct {
 // URI is set only for SymbolInformation, whose symbols carry their own file —
 // which is what workspace/symbol returns.
 type RawSymbol struct {
-	Name           string
-	Detail         string
-	Kind           int
-	Range          RawRange
-	SelectionRange RawRange
-	Container      string
-	URI            string
-	Children       []RawSymbol
+	Name              string
+	Detail            string
+	Kind              int
+	Range             RawRange
+	SelectionRange    RawRange
+	HasSelectionRange bool
+	Container         string
+	URI               string
+	Children          []RawSymbol
 }
 
 // RawDiagnostic is one decoded diagnostic, carrying the URI of its publish.
@@ -289,6 +290,7 @@ func decodeSymbol(raw json.RawMessage) (RawSymbol, error) {
 		sym.Range = *js.Range
 		if js.SelectionRange != nil {
 			sym.SelectionRange = *js.SelectionRange
+			sym.HasSelectionRange = true
 		} else {
 			sym.SelectionRange = *js.Range
 		}

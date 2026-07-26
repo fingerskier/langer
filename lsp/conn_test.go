@@ -332,11 +332,19 @@ func TestConnDiagnosticsNotificationsReachTheHandler(t *testing.T) {
 	srv := newScriptedServer(t, serverSide)
 	go srv.run()
 
-	got := make(chan string, 1)
+	type notification struct {
+		uri     string
+		version int
+	}
+	got := make(chan notification, 1)
 	c := newConn(clientSide, connHandlers{
-		diagnostics: func(uri string, _ []wire.RawDiagnostic) {
+		diagnostics: func(uri string, version *int, _ []wire.RawDiagnostic) {
+			n := notification{uri: uri}
+			if version != nil {
+				n.version = *version
+			}
 			select {
-			case got <- uri:
+			case got <- n:
 			default:
 			}
 		},
@@ -347,11 +355,11 @@ func TestConnDiagnosticsNotificationsReachTheHandler(t *testing.T) {
 		_ = serverSide.Close()
 	})
 
-	srv.publishDiagnostics("file:///r/a.ts", nil)
+	srv.publishDiagnosticsVersion("file:///r/a.ts", 7, nil)
 	select {
-	case uri := <-got:
-		if uri != "file:///r/a.ts" {
-			t.Fatalf("uri = %q", uri)
+	case n := <-got:
+		if n.uri != "file:///r/a.ts" || n.version != 7 {
+			t.Fatalf("notification = %+v", n)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("publishDiagnostics never reached the handler")

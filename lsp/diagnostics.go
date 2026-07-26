@@ -26,9 +26,11 @@ type diagnostics struct {
 }
 
 type diagEntry struct {
-	epoch uint64
-	at    time.Time
-	diags []protocol.Diagnostic
+	epoch           uint64
+	at              time.Time
+	diags           []protocol.Diagnostic
+	documentVersion int
+	versioned       bool
 }
 
 func newDiagnostics(ck clock.Clock) *diagnostics {
@@ -61,11 +63,61 @@ func (d *diagnostics) current(path string) uint64 {
 	return d.epoch + 1
 }
 
+// currentForVersion returns a cached epoch only when the server explicitly
+// tied that publishDiagnostics payload to the document version we still hold.
+// Versionless pushes remain usable by an explicit settle call, but cannot
+// prove that a same-text no-op is safe after temporary document views.
+func (d *diagnostics) currentForVersion(path string, documentVersion int) uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e, ok := d.entries[path]; ok && e.versioned && e.documentVersion == documentVersion {
+		return e.epoch
+	}
+	return d.epoch + 1
+}
+
+// invalidate prevents diagnostics for an earlier local document view from
+// being reused as current after didOpen/didChange/didClose. It deliberately
+// does not advance the global epoch: the next server push remains the first
+// epoch that can satisfy a mark taken for the mutation.
+func (d *diagnostics) invalidate(path string) {
+	d.mu.Lock()
+	delete(d.entries, path)
+	wake := d.wake
+	d.wake = make(chan struct{})
+	d.mu.Unlock()
+
+	close(wake)
+}
+
 // publish records a server push and wakes every waiter.
 func (d *diagnostics) publish(path string, diags []protocol.Diagnostic) {
+	d.publishEntry(path, 0, false, diags)
+}
+
+func (d *diagnostics) publishVersioned(
+	path string,
+	documentVersion int,
+	diags []protocol.Diagnostic,
+) {
+	d.publishEntry(path, documentVersion, true, diags)
+}
+
+func (d *diagnostics) publishEntry(
+	path string,
+	documentVersion int,
+	versioned bool,
+	diags []protocol.Diagnostic,
+) {
 	d.mu.Lock()
 	d.epoch++
-	d.entries[path] = &diagEntry{epoch: d.epoch, at: d.ck.Now(), diags: diags}
+	d.entries[path] = &diagEntry{
+		epoch:           d.epoch,
+		at:              d.ck.Now(),
+		diags:           diags,
+		documentVersion: documentVersion,
+		versioned:       versioned,
+	}
 	wake := d.wake
 	d.wake = make(chan struct{})
 	d.mu.Unlock()

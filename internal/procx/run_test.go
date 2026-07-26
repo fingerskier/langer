@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fingerskier/langer/internal/procx"
+	"golang.org/x/sys/unix"
 )
 
 func writeScript(t *testing.T, body string) string {
@@ -229,7 +230,7 @@ func TestDetachedProcessGetsItsOwnSession(t *testing.T) {
 	}
 	defer func() { _ = p.Kill() }()
 
-	sid, err := syscall.Getsid(p.PID())
+	sid, err := unix.Getsid(p.PID())
 	if err != nil {
 		t.Fatalf("Getsid: %v", err)
 	}

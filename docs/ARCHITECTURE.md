@@ -1,7 +1,8 @@
-# langer — Architecture Contract (FROZEN)
+# langer — Architecture Contract (FROZEN, M3 AMENDED)
 
-**Status:** FROZEN for v0.1 (milestones M1–M6).
-**Authority:** `SPEC.md` v0.3 is authoritative. This document is subordinate to it.
+**Status:** FROZEN for v0.1 (milestones M1–M6), with the owner-approved M3
+identity/indexing amendment of 2026-07-25 incorporated.
+**Authority:** `SPEC.md` v0.4 is authoritative. This document is subordinate to it.
 Where this document adds something the spec does not state, it is marked
 **[SPEC-ADDITION]** and listed in §11. Nothing here may override SPEC.md.
 **Reconciled against:** the shipped, green M0 tree (2026-07-25).
@@ -67,6 +68,10 @@ exists on this machine. `go build ./...`, `go vet ./...`, `go test ./...` and
 | `document_symbols` shape | **Flat list**; hierarchy is carried by the `container` string. No `children` field. | §10.4 |
 | `possibly_stale` | A field of the **diagnostics result envelope**, not of an individual diagnostic. | §10.8 |
 | MCP tool set | Exactly **12**: the nine ✅ SPEC §4.2 tools + `open_document`, `close_document`, `index_status` (PLAN M4). Never `reindex` or `list_language_servers`. | §5.10 |
+| Repository namespace | Normalized path slug from system-Git `origin` (normally `<org>/<name>`, deeper namespaces preserved); canonical CLI-supplied workspace root, normally cwd, is the no-origin fallback. No network lookup. | SPEC §3.2, §10.14 |
+| Cached symbol identity | `stable_key` remains descriptive/non-unique. References use workspace-scoped `symbol_key = repo_namespace + "\x1f" + definition_path + "\x1f" + stable_key`; residual same-file ambiguity goes live. | SPEC §5.2, §10.14 |
+| Cache completeness | Hash-matching per-file rows only. Incomplete workspace/reference sets return `NOT_READY`, never partial success. | SPEC §3.4, §10.15 |
+| Cached symbol search | Unicode-aware case-insensitive fuzzy order: exact, prefix, substring, boundary subsequence, general subsequence; apply the limit after ranking. | SPEC §4.2, §5.2 |
 | Overlays live in | The **daemon**, not the MCP process. `session_id` therefore rides on every IPC request. | §10.9 |
 | Overlay isolation | Achieved by **serialization** under a per-`(server, path)` lock, not by parallel state. A language server holds exactly one document state per URI. | §6.6 |
 | Integration tests | Behind `//go:build integration`. `go test ./...` is fast and hermetic; `go test -tags=integration ./...` drives real language servers. Both must pass at every milestone gate. | §10.11 |
@@ -114,10 +119,10 @@ edit `go.mod` or `go.sum`.
 | 6 | `internal/procx/` | M1 (M6 hardens) | The **only** package permitted to import `os/exec`. Enforces SPEC §9 (never execute workspace-local binaries) and owns process groups so language-server grandchildren cannot leak. |
 | 7 | `lsp/wire/` | M1 | Pure LSP wire types, Content-Length framing, union decoders, UTF-16↔UTF-8 conversion, and normalisation into `protocol` types. No goroutines, no I/O beyond an `io.ReadWriter`. |
 | 8 | `lsp/` | M1 | One live language server: initialize/capabilities, document state, diagnostics settle, crash detection, exponential-backoff restart, resync. |
-| 9 | `index/` | M3 | SPEC §5 SQLite index: schema, migrations, the single shared driver module (WAL, `busy_timeout`, read pool + single writer), stable-key references, cache-kill-on-change, GC under a `meta` lease. |
+| 9 | `index/` | M3 | SPEC §5 SQLite index: schema, migrations, the single shared driver module (WAL, `busy_timeout`, read pool + single writer), workspace-scoped symbol-key references, cache-kill-on-change, GC under a `meta` lease. |
 | 10 | `internal/watch/` | M3 | SPEC §3.4 indexing scope (the project-files-only predicate + content hashing) and the debounced fsnotify watcher. One definition of "project file", shared by scanner and watcher. |
 | 11 | `internal/workspace/` | M2 (M3/M5 extend) | The per-workspace actor and semantic brain: index-vs-live decision, cache-kill-on-change, capability→`UNSUPPORTED` gating, speculative overlays, `edit_token` minting and verification. |
-| 12 | `daemon/` | M2 (M6 hardens) | The long-running process: Unix socket server, single-instance locks, idle-sunset actor, session registry, GC scheduler, shutdown ordering. Owns no semantics. |
+| 12 | `daemon/` | M2 (M3/M6 extend) | The long-running process: local IPC server, single-instance locks, idle-sunset actor, session registry, GC scheduler, shutdown ordering. Owns no semantics. |
 | 13 | `internal/daemonctl/` | M2 | Client-side auto-start and dial (SPEC §3.1). Runs **in the MCP process**; deliberately cannot reach daemon state. |
 | 14 | `mcp/` | M4 (M5 extends) | The nine v0.1 tools over the MCP SDK: argument structs, SPEC §4.4 result envelopes, error-envelope discipline, session-ID mapping. |
 | 15 | `internal/testutil/` | M1 | Test-only: hermetic XDG env, fixture paths, integration-server locator with `t.Skip`, goroutine-leak assertion. No non-test package may import it. |
@@ -501,6 +506,7 @@ const (
 	IndexScanning IndexState = "scanning"
 	IndexIndexing IndexState = "indexing"
 	IndexReady    IndexState = "ready"
+	IndexFailed   IndexState = "failed"
 )
 
 // ServerState is the SPEC §3.3 supervision state machine.
@@ -694,6 +700,9 @@ type IndexStatusResult struct {
 	FilesTotal      int            `json:"files_total"`
 	LanguageServers []ServerStatus `json:"language_servers,omitempty"`
 	LastIndexedUnixMS int64        `json:"last_indexed_unix_ms,omitempty"`
+	// Error is present iff State == IndexFailed. It is always a structured
+	// SPEC §3.6 error; failure detail never leaks into a free-text state.
+	Error *Error `json:"error,omitempty"`
 }
 
 // IndexState, ServerState and ServerStatus are declared in protocol/status.go,
@@ -978,6 +987,18 @@ type Supervisor interface {
 //
 // Every method returns a *protocol.Error. A crashed server returns
 // SERVER_CRASHED from every method rather than blocking.
+//
+// IndexSymbol is internal indexing data, never an IPC/MCP result. The public
+// protocol.Symbol stays frozen; SelectionRange is retained so the indexer can
+// ask for references at the identifier rather than the declaration body.
+// HasSelectionRange distinguishes an explicit DocumentSymbol selectionRange
+// from a fallback copied from range.
+type IndexSymbol struct {
+	protocol.Symbol
+	SelectionRange    protocol.Range
+	HasSelectionRange bool
+}
+
 type Server interface {
 	// Generation increments on every restart. A caller that cached state
 	// (open documents, diagnostic epochs) resyncs when it changes.
@@ -999,10 +1020,17 @@ type Server interface {
 	// achieved without a second language server process (docs §6.6).
 	WithText(ctx context.Context, path, text string, fn func(ctx context.Context, epoch uint64) error) error
 
+	// WithDiskText is M3's indexing serialization seam. It holds the same
+	// per-(server,path) lock for the whole callback, makes the server view the
+	// caller-supplied DISK bytes, then restores the prior open/closed state.
+	// It never reads a session overlay.
+	WithDiskText(ctx context.Context, path, languageID, text string, fn func(ctx context.Context, epoch uint64) error) error
+
 	Definition(ctx context.Context, path string, pos protocol.Position) ([]protocol.Location, error)
 	References(ctx context.Context, path string, pos protocol.Position, includeDecl bool) ([]protocol.Location, error)
 	Hover(ctx context.Context, path string, pos protocol.Position) (*protocol.Hover, error)
 	DocumentSymbols(ctx context.Context, path string) ([]protocol.Symbol, error)
+	DocumentSymbolsForIndex(ctx context.Context, path string) ([]IndexSymbol, error)
 	WorkspaceSymbols(ctx context.Context, query string, limit int) ([]protocol.Symbol, error)
 	Rename(ctx context.Context, path string, pos protocol.Position, newName string) ([]protocol.FileEdit, error)
 
@@ -1034,6 +1062,18 @@ type Options struct {
 
 func NewSupervisor(opts Options) (Supervisor, error)
 ```
+
+Restart publication is a barrier, not an assignment. A replacement connection
+is initialized first, but `server.setSession` is delayed until resync succeeds.
+The old open-document snapshot is only a candidate list: resync reacquires each
+document's per-path lock, re-reads text/language/open state under that lock, and
+then sends `didOpen`. This prevents a concurrent `WithDiskText` restore or close
+from publishing a temporary view into the replacement generation. Callers
+therefore observe either the old crashed generation or the fully initialized,
+fully resynchronized replacement, never a half-resynchronized session.
+`WithDiskText` restores the local document snapshot first and, if its original
+generation died, skips `didChange`/`didClose` against the replacement; the
+locked resync replays the restored state instead.
 
 **The `Server` interface above is frozen in M1, in full.** `Rename` is included
 even though PLAN M1's request list stops at `workspace/symbol`, because widening
@@ -1082,39 +1122,63 @@ package index
 //   file:<path>?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)
 // and additionally &_txlock=immediate on the write pool.
 type Store interface {
-	EnsureWorkspace(ctx context.Context, root string) (protocol.WorkspaceID, error)
+	// root is canonical and is the durable workspace identity. repoNamespace
+	// is portable metadata used inside SymbolKey; it never replaces root
+	// scoping and may be the root itself when no usable origin exists.
+	EnsureWorkspace(ctx context.Context, root, repoNamespace string) (protocol.WorkspaceID, error)
 
 	// FileState returns the recorded content hash for a workspace-relative
 	// path. The caller compares it with the on-disk hash to decide staleness
 	// (SPEC §3.4); the index never stats the filesystem itself.
 	FileState(ctx context.Context, ws protocol.WorkspaceID, path string) (hash string, found bool, err error)
 
-	// PutFile replaces one file's cached data — metadata, symbols,
-	// references, diagnostics — in ONE short transaction (SPEC §3.2).
+	// PutFile replaces one file's metadata, symbols and diagnostics in ONE
+	// short transaction (SPEC §3.2). Cross-file references are deliberately
+	// not owned by this operation.
 	PutFile(ctx context.Context, ws protocol.WorkspaceID, f FileRecord) error
 
+	// ReplaceReferencesBySymbolKey atomically replaces the COMPLETE cross-file
+	// set for one workspace-scoped symbol. Readers see either the old complete
+	// set or the new complete set, never a per-file intermediate.
+	ReplaceReferencesBySymbolKey(ctx context.Context, ws protocol.WorkspaceID, symbolKey string, refs []Reference) error
+
 	// InvalidateFile implements cache-kill-on-change (SPEC §3.4): it deletes
-	// this file's symbols, references and diagnostics. References FROM other
-	// files survive, because they are keyed by stable_key, not by symbol row
-	// id (SPEC §5.2).
+	// this file's symbols, diagnostics and reference LOCATIONS, and marks each
+	// affected SymbolKey set incomplete. An incomplete set is never returned;
+	// it becomes readable again only after an atomic complete replacement.
 	InvalidateFile(ctx context.Context, ws protocol.WorkspaceID, path string) error
 	DeleteFile(ctx context.Context, ws protocol.WorkspaceID, path string) error
+	// ReconcileWorkspace removes persisted files absent from Scanner.List,
+	// removes reference locations on those paths, and marks every affected
+	// reference set incomplete. The replacement scan can then heal them.
+	ReconcileWorkspace(ctx context.Context, ws protocol.WorkspaceID, existingPaths []string) (filesPruned int, err error)
 
 	DocumentSymbols(ctx context.Context, ws protocol.WorkspaceID, path string) ([]protocol.Symbol, error)
+	// SearchSymbols performs Unicode-aware case-insensitive fuzzy ranking
+	// (exact > prefix > substring > boundary subsequence > subsequence) before
+	// applying limit; deterministic metadata tie-breaks stabilize results.
 	SearchSymbols(ctx context.Context, ws protocol.WorkspaceID, query string, limit int) ([]protocol.Symbol, error)
-	ReferencesByStableKey(ctx context.Context, ws protocol.WorkspaceID, key string) ([]protocol.Location, error)
+	// SymbolKeyAt returns unique=false for zero OR multiple candidates at the
+	// position. The caller then goes live; it never guesses through ambiguity.
+	SymbolKeyAt(ctx context.Context, ws protocol.WorkspaceID, path string, pos protocol.Position) (key string, unique bool, err error)
+	// ReferencesBySymbolKey returns NOT_READY when invalidation marked the set
+	// incomplete; it never returns a partial set.
+	ReferencesBySymbolKey(ctx context.Context, ws protocol.WorkspaceID, key string) ([]protocol.Location, error)
 	Diagnostics(ctx context.Context, ws protocol.WorkspaceID, path string) ([]protocol.Diagnostic, error)
 	Status(ctx context.Context, ws protocol.WorkspaceID) (protocol.IndexStatusResult, error)
 
-	// GC prunes deleted files, dead workspaces and expired diagnostics under
-	// an EXPIRING lease in `meta` (SPEC §3.2). ran=false means another daemon
-	// holds the lease. It honours ctx between batches so a sunset is never
-	// blocked waiting for GC. VACUUM runs only from Checkpoint, never here.
+	// GC invalidates semantic snapshots past the diagnostic retention horizon
+	// and prunes workspaces whose roots remained missing for the retention
+	// period under an EXPIRING lease in `meta` (SPEC §3.2). ran=false means
+	// another daemon holds the lease. It
+	// honours ctx between batches, and a heartbeat renews the lease while it
+	// runs. VACUUM runs only from Checkpoint, never here.
 	GC(ctx context.Context) (ran bool, stats GCStats, err error)
 
-	// Checkpoint truncates the WAL and may VACUUM. Called during sunset drain
-	// ONLY: VACUUM blocks every writer and cannot run inside a transaction,
-	// and with continuous readers the WAL never auto-checkpoints.
+	// Checkpoint truncates the WAL and VACUUMs only when freelist pages exceed
+	// 25% of page_count. Called during sunset drain ONLY: VACUUM blocks every
+	// writer and cannot run inside a transaction, and with continuous readers
+	// the WAL never auto-checkpoints.
 	Checkpoint(ctx context.Context) error
 
 	Close() error
@@ -1127,28 +1191,76 @@ type FileRecord struct {
 	ContentHash  string    // SHA-256 hex (SPEC §5.2)
 	SizeBytes    int64
 	ModTime      time.Time
-	Symbols      []protocol.Symbol
-	References   []Reference
+	Symbols      []SymbolRecord
 	Diagnostics  []protocol.Diagnostic
 }
 
-// Reference is keyed by stable_key so cross-file references survive a
-// re-index of the defining file (SPEC §5.2).
-type Reference struct {
-	SymbolStableKey string
-	Range           protocol.Range
-	IsDefinition    bool
+// SymbolRecord keeps SelectionRange internal. StableKey is descriptive,
+// deliberately non-unique metadata; SymbolKey is the cached-reference key.
+type SymbolRecord struct {
+	Symbol         protocol.Symbol
+	SelectionRange protocol.Range
+	StableKey      string
+	SymbolKey      string
 }
 
-type GCStats struct{ FilesPruned, SymbolsPruned, DiagnosticsPruned int }
+// Reference belongs to the complete SymbolKey set passed separately to
+// ReplaceReferencesBySymbolKey.
+type Reference struct {
+	Path         string // workspace-relative, slash-separated
+	Range        protocol.Range
+	IsDefinition bool
+}
+
+type GCStats struct{ FilesPruned, SymbolsPruned, DiagnosticsPruned, WorkspacesPruned int }
+
+const (
+	DefaultGCAttemptInterval         = time.Hour
+	DefaultGCLeaseDuration           = 60 * time.Second
+	DefaultGCLeaseRenewal            = 20 * time.Second
+	DefaultDiagnosticRetention       = 7 * 24 * time.Hour
+	DefaultMissingWorkspaceRetention = 30 * 24 * time.Hour
+)
 
 // StableKey is name + container + kind (SPEC §5.1), joined by a separator
-// that cannot appear in an identifier. It lives here, not in protocol/,
-// because it is an index concern.
+// that cannot appear in an identifier. It is NOT unique.
 func StableKey(s protocol.Symbol) string   // s.Name + "\x1f" + s.Container + "\x1f" + string(s.Kind)
+
+// SymbolKey scopes the stable metadata to the normalized repository namespace
+// and slash-separated workspace-relative definition path. Store calls still
+// require workspace ID, so clones/worktrees never share cache rows.
+func SymbolKey(repoNamespace, definitionPath, stableKey string) string
 
 func Open(ctx context.Context, path string, ck clock.Clock) (Store, error)
 ```
+
+The schema stores `repo_namespace` and nullable `missing_since` on
+`workspaces`, and `stable_key`, `symbol_key`, and the four `selection_*`
+coordinates on `symbols`. Complete-reference publication is represented by
+`reference_sets(workspace_id, symbol_key, complete, updated_at_unix_ms)`, whose
+first two columns are the composite primary key. The `"references"` table has
+no `file_id`: each row stores `(workspace_id, symbol_key, ordinal, path)`, its
+range and `is_definition`, has a composite foreign key to `reference_sets`,
+and is unique on `(workspace_id, symbol_key, ordinal)`. The ordinal preserves
+the language server's complete-set order while `path` permits cross-file
+locations without inventing a file-row ownership relationship.
+
+There is deliberately no unique constraint on `stable_key` or `symbol_key`
+inside `symbols`: overloads or duplicate declarations can still collide within
+one file, and that condition is represented as ambiguity so the workspace goes
+live rather than merging answers. The composite primary key on
+`reference_sets` identifies one publication state, not one declaration.
+
+The seven-day retention boundary is keyed by `files.last_indexed_unix_ms` and
+expires the entire atomic semantic snapshot, not just diagnostics rows. In one
+write transaction GC marks affected reference sets incomplete, deletes symbols
+and diagnostics, and clears `files.content_hash`. This also expires an
+explicitly clean file whose diagnostic set has no rows. Snapshot-guarded reads
+then return `NOT_READY`; workspace lazy healing repopulates the file.
+
+GC sets `missing_since` on the first pass that cannot stat a workspace root,
+clears it when the root is present again, and prunes only when the root is still
+missing at least 30 days later. Mere inactivity never deletes a workspace.
 
 The SQL table `references` is a **SQLite reserved word**: every statement
 touching it must quote it as `"references"`. Getting this wrong in one query out
@@ -1166,17 +1278,27 @@ package watch
 // Scope is defined ONCE here and consumed by both the indexer and the
 // watcher — if they disagree, files get indexed but never invalidated.
 type Scanner interface {
+	// RepositoryNamespace returns the normalized path slug from the system-Git
+	// origin (normally org/name; deeper namespace segments survive). A missing
+	// or unusable origin is not an error: it returns the canonical root. Only
+	// cancellation or an invariant violation is an error.
+	RepositoryNamespace(ctx context.Context, root string) (string, error)
+
 	// List enumerates in-scope files, workspace-relative and sorted.
 	// Primary oracle: `git ls-files --cached --others --exclude-standard`
 	// (git's own ignore semantics: global excludes, nested .gitignore,
 	// .git/info/exclude — all of which a library gets subtly wrong),
-	// spawned through procx.Runner. Falls back to a walk with the
-	// dependency-directory denylist when root is not a git repo.
+	// spawned through procx.Runner. The dependency-directory denylist is
+	// applied AFTER Git's answer too, so a tracked node_modules file is not
+	// indexed. Falls back to a denylisted walk when Git is unavailable or root
+	// is not a Git repo.
 	List(ctx context.Context, root string) ([]string, error)
 
 	// InScope is the pure predicate form, used by the watcher on each event
-	// and exhaustively table-tested. Denylist: node_modules, vendor, target,
-	// .venv, venv, dist, build, .git, __pycache__, .tox, .mypy_cache.
+	// and exhaustively table-tested. It enforces path safety and the directory
+	// denylist; Git-ignore membership remains Scanner.List's responsibility.
+	// Denylist: node_modules, vendor, target, .venv, venv, dist, build, .git,
+	// __pycache__, .tox, .mypy_cache.
 	InScope(root, rel string) bool
 
 	// Hash returns the SHA-256 hex digest of a file's bytes (SPEC §5.2).
@@ -1185,6 +1307,11 @@ type Scanner interface {
 
 // Watcher reports debounced, de-duplicated project-file changes.
 type Watcher interface {
+	// Ready closes after all initial recursive watches are installed AND the
+	// watcher has seeded its known set from Scanner.List. Registry waits for
+	// this before its own Scanner.List so first-scan edits cannot fall into a
+	// blind window.
+	Ready() <-chan struct{}
 	// Events yields coalesced batches. A `git checkout` producing 10k raw
 	// events must yield a handful of batches, not 10k. The channel is closed
 	// when Run returns.
@@ -1198,16 +1325,41 @@ type Batch struct {
 	Deleted []string
 }
 
-func NewScanner(r procx.Runner) Scanner
+func NewScanner(resolver procx.Resolver, runner procx.Runner) Scanner
 func NewWatcher(root string, sc Scanner, ck clock.Clock, debounce time.Duration) (Watcher, error)
 ```
 
+Both scanner Git operations first call
+`resolver.Resolve("git", root, false)` and pass that absolute result to
+`runner.Output`; `git` is never found through a workspace-relative or
+workspace-prepended PATH. Namespace parsing is local and deterministic:
+
+```
+https://host/org/repo.git       -> org/repo
+ssh://git@host/group/org/repo   -> group/org/repo
+git@host:group/org/repo.git     -> group/org/repo
+```
+
+Strip transport/user/host, query/fragment, leading and trailing slashes, and
+one trailing `.git`; normalize separators to `/`; preserve path depth and
+segment spelling. A local path/file URL, fewer than two path segments,
+malformed output, no `origin`, non-Git root, or unavailable system Git uses
+the canonical absolute root unchanged. No network operation is permitted.
+
 fsnotify is **not recursive** on macOS or Linux: walk the tree and add one watch
 per directory, adding and removing watches as directories appear and disappear.
-Prune out-of-scope trees **before** watching — on macOS the kqueue backend opens
-a file descriptor per file in a watched directory, so watching `node_modules`
-exhausts `RLIMIT_NOFILE` and leaves later directories silently unwatched.
-Normalise editor atomic-save, which arrives as CREATE rather than WRITE.
+Prune denylisted/path-unsafe trees **before** watching — on macOS the kqueue
+backend opens a file descriptor per file in a watched directory, so watching
+`node_modules` exhausts `RLIMIT_NOFILE` and leaves later directories silently
+unwatched. Git-ignored directories that are not denylisted remain watched so a
+later ignore-rule edit can admit them. Raw CREATE/WRITE candidates use
+`Lstat`; symlinks are never reported as project files. At every debounce flush
+the watcher reruns `Scanner.List` and diffs it with its prior known set. That
+authoritative reconciliation filters ignored raw events and turns an in-tree
+`.gitignore` change into deletions/new changes. Every flush also observes the
+current `.git/info/exclude` and global excludes, but those denied/external
+files are not themselves watched. Normalise editor atomic-save, which arrives
+as CREATE rather than WRITE.
 
 ### 5.7 `internal/workspace` (M2; extended M3, M5)
 
@@ -1231,7 +1383,11 @@ type RegistryOptions struct {
 	Clock       clock.Clock
 	Resolver    procx.Resolver
 	Runner      procx.Runner
-	NewScanner  func() watch.Scanner // nil until M3
+	NewScanner  func(procx.Resolver, procx.Runner) watch.Scanner
+	NewWatcher  func(root string, sc watch.Scanner, ck clock.Clock, debounce time.Duration) (watch.Watcher, error)
+	// OnFileActivity is non-blocking and nil-safe. The daemon wires
+	// sunset.noteActivity; every non-empty watcher batch calls it once.
+	OnFileActivity func()
 	OverlayTTL  time.Duration        // default 5m (SPEC §4.2)
 }
 
@@ -1284,7 +1440,51 @@ func (w *Workspace) Status(ctx context.Context) (protocol.IndexStatusResult, err
 // STALE_EDIT path is unit-testable without a language server.
 ```
 
-### 5.8 `daemon` (M2, hardened M6)
+M3's `Registry.Open` order is normative:
+
+1. canonicalize the CLI-supplied root;
+2. construct the resolver-aware scanner and obtain `repo_namespace`;
+3. call `EnsureWorkspace(root, repo_namespace)`;
+4. construct and start the watcher, and wait until it has installed its
+   recursive watches and seeded its own known set through `Scanner.List`;
+5. only then call the workspace's `Scanner.List` and start the initial or
+   resumed scan.
+
+Before it queues resume/index work, the workspace passes that enumeration to
+`Store.ReconcileWorkspace`. The Store atomically removes file rows and
+reference locations outside the authoritative scope and marks affected
+reference sets incomplete, so an offline delete or ignore-rule change cannot
+survive a daemon restart.
+
+For each non-empty watcher batch the workspace calls `OnFileActivity`, acquires
+the affected per-path serialization leaves, synchronously invalidates changed
+paths/deletes removed paths, increments their generations, and only then queues
+replacement work. An index job reads disk bytes and their hash, enters
+`lsp.Server.WithDiskText`, obtains `DocumentSymbolsForIndex`, diagnostics, and
+complete reference sets, then re-hashes before committing. Hash or generation
+mismatch discards and reschedules the job. `PutFile` commits matching
+metadata/symbols/diagnostics; each reference set commits separately through
+`ReplaceReferencesBySymbolKey`. Cached reference discovery runs only for an
+unambiguous symbol whose `IndexSymbol.HasSelectionRange` is true. LSP
+`SymbolInformation` and malformed `DocumentSymbol` results use a fallback
+range for symbol storage, but that range is not a trustworthy identifier
+position, so no reference set is cached and reference queries go live.
+Speculative overlays are never an index input.
+
+Queries perform the disk-hash check before a per-file cache read. A reference
+query additionally requires `SymbolKeyAt(...).unique`; otherwise it goes live.
+Workspace-wide symbol/diagnostic queries return `NOT_READY` until the initial
+scan is complete. A fatal scan error transitions status to `IndexFailed` and
+sets `IndexStatusResult.Error`; it never publishes partial rows as ready.
+
+GC invalidation is healed lazily. A per-file stale/`NOT_READY` cache read
+synchronously invalidates and queues that path and serves the query live. A
+Store-level `NOT_READY` from a workspace-wide query, or a degraded Store count
+observed by `index_status`, signals a coalesced background pass over all known
+paths; workspace-wide results remain `NOT_READY` until the pass makes the
+snapshot complete.
+
+### 5.8 `daemon` (M2; extended M3, hardened M6)
 
 ```go
 package daemon
@@ -1305,6 +1505,9 @@ type Options struct {
 	Clock      clock.Clock
 	IdleTimeout time.Duration    // default 30m (SPEC §3.1)
 	MaxInFlight int              // default 64; over-limit ⇒ NOT_READY + retry_after_ms
+	// OpenStore is the persistence-construction seam. Production defaults to
+	// index.Open; Run invokes it after acquiring the liveness lock.
+	OpenStore func(context.Context, string, clock.Clock) (index.Store, error)
 }
 
 func NewServer(opts Options) (*Server, error)
@@ -1324,6 +1527,21 @@ func (s *Server) Run(ctx context.Context) error
 func SocketPath(cfg *config.Config, root string) (string, error)
 func LockPaths(cfg *config.Config, root string) (liveness, spawn string, err error)
 ```
+
+M3 extends `Run` to open the shared store through `Options.OpenStore`, pass it
+and the two factories into `RegistryOptions`, and wire `OnFileActivity` to
+`sunset.noteActivity`. Construction belongs to `Run`, after the liveness lock,
+so startup failure and shutdown both use the same checkpoint/close lifecycle;
+an empty database path deliberately retains live-query-only mode. The GC
+scheduler attempts a pass every `index.DefaultGCAttemptInterval`; the Store's
+expiring lease makes concurrent daemons harmless. Shutdown retains §6.5 order:
+watchers, index workers, language servers, checkpoint/conditional VACUUM, Store
+close.
+
+M6 adds the Windows implementation behind platform files: whole-process-tree
+teardown, secure local IPC and endpoint discovery/locking, and platform
+permission tests. The public `protocol.Service` and root-derived endpoint
+identity do not change. v0.1 is not permitted to become Unix-only.
 
 ### 5.9 `internal/daemonctl` (M2)
 
@@ -1477,6 +1695,11 @@ relays over one `daemonctl.Client`. `StdioTransport` means **one MCP session per
 process**, so "multiple concurrent clients" (SPEC §8) is N MCP processes against
 one daemon — which is precisely why overlays are daemon-resident (§6.6).
 
+Within each workspace, startup is watcher-first: `Watcher.Run` reaches its
+ready point before the initial scanner can enqueue work. Batch handling performs
+synchronous invalidation and generation bumps before the bounded indexer pool
+sees the replacement job.
+
 ### 6.3 Context hierarchy
 
 ```
@@ -1517,9 +1740,11 @@ Two rules that will otherwise silently corrupt state:
 | diagnostics cache + waiters | `lsp` diagnostics leaf | fan-in from the reader goroutine, fan-out to N waiters via a **broadcast channel that is closed and replaced** on each push. **Never `sync.Cond`** — it cannot compose with a context deadline and strands a waiter at shutdown, hanging the test binary |
 | supervision state machine | `lsp` supervisor | mutex leaf; the only holder of a `procx.Process` |
 | overlays | workspace actor | mutex leaf; swept by one clock-driven goroutine, never a timer per overlay |
+| per-path index generation | workspace actor / document leaf | watcher invalidation and index commit serialize on the same path; generation or second-hash mismatch discards the job |
 | workspace registry | daemon `Core` | mutex leaf; no outbound calls under the lock |
 | SQLite writer | `index` single-connection write pool | one `BEGIN IMMEDIATE` transaction at a time |
-| GC lease | `meta` row with an **expiry** | compare-and-swap `UPDATE` inside one IMMEDIATE transaction, `RowsAffected` checked, renewed by heartbeat. A boolean flag would wedge GC forever the first time a daemon is SIGKILLed mid-pass, and nothing would ever report it |
+| reference-set completeness | `index` single writer | invalidation marks a `SymbolKey` set incomplete; atomic replacement publishes one complete generation |
+| GC lease | `meta` row with an **expiry** | Under the single writer's `BEGIN IMMEDIATE`, read the current owner/expiry and, only when absent or expired, `INSERT … ON CONFLICT DO UPDATE`; an unexpired lease is busy even for the same Store. Renewal similarly verifies ownership then updates under `BEGIN IMMEDIATE` every 20 seconds. This serialization is the exclusion mechanism—there is no `RowsAffected` CAS. A boolean flag would wedge GC forever after SIGKILL |
 
 ### 6.5 Shutdown ordering — strictly reverse dependency order
 
@@ -1577,6 +1802,11 @@ handled. Once draining, the daemon **refuses the handshake** so `daemonctl`
 loops back to spawning a fresh daemon rather than surfacing a confusing
 transport error to the agent.
 
+M3 wires `RegistryOptions.OnFileActivity` to this actor. Each non-empty
+coalesced watcher batch emits exactly one activity signal before invalidation,
+so sustained repository changes reset sunset without one signal per raw
+fsnotify event.
+
 ### 6.8 Single instance — two locks, not one
 
 - `daemon-<hash>.spawn.lock` — held by the **client** for the duration of a
@@ -1617,10 +1847,15 @@ children inherit their own pipes — keep them separated.
 | **M0** ✅ | `protocol`, `config`, `cmd/langer`, `internal/deps`, `testdata/` | — | green |
 | **M1** | `internal/clock`, `internal/procx`, `lsp/wire`, `lsp`, `internal/testutil` | `config` (§4.1a), `protocol` (§4.1b), `testdata/README.md` (§1.8 note) | real-server integration tests for definition/references/hover/symbols/diagnostics on both fixtures; non-BMP UTF-16 test; crash+backoff test with a fake `Runner`; `procx.Resolve` exhaustive table test; import-rule test (rules 2 and 4) |
 | **M2** | `daemon`, `internal/daemonctl`, `internal/workspace` (live-query only) | `protocol` (§4.2–4.4), `cmd/langer` (`runDaemon`) | two concurrent clients on one daemon; killing a language server does not kill the daemon; idle sunset with the fake clock; version-mismatch drain-and-restart; **every SPEC §3.6 code exercised** |
-| **M3** | `index`, `internal/watch` | `internal/workspace` (index-vs-live, cache-kill-on-change), `internal/deps` (drop sqlite + fsnotify), `cmd/langer` (import-rule test rules 1 and 3) | staleness/invalidation; stable-key reference survival across re-index; GC under an expiring lease; edit reflected without full re-index; index survives daemon restart |
+| **M3** | `index`, `internal/watch` | `lsp` + `lsp/wire` (internal selection range and disk-text serialization), `protocol` (failed index status), `internal/workspace` (watcher-first index-vs-live), `daemon` (Store/GC/activity wiring), `internal/deps` (drop sqlite + fsnotify), `cmd/langer` (import-rule test rules 1 and 3) | origin namespace + canonical-root fallback; collision-safe symbol keys; atomic complete reference replacement; watcher/scan race discard; structured failure; timed GC lease/retention; edit reflected without full re-index; restart survival |
 | **M4** | `mcp` | `cmd/langer` (`runMCP`, live `runStatus`), `internal/deps` (delete the package) | SPEC §11 navigation criteria end-to-end via MCP on both fixtures; exact nine-tool set asserted; no handler returns a Go error |
 | **M5** | — | `internal/workspace` (overlays, edit tokens), `mcp` (rename/apply/simulate), `daemon` (session lifecycle) | rename round-trip; `STALE_EDIT` after an out-of-band change; two sessions' overlays isolated; overlay diagnostics accurate with nothing written to disk |
-| **M6** | — | `daemon` + `index` + `internal/procx` (permissions, hardening) | the tripwire test; 0600 on socket, locks and DB; full SPEC §11 checklist recorded in `PLAN.md` |
+| **M6** | — | `daemon` + `internal/daemonctl` + `internal/procx` (permissions, Windows process/transport support, hardening), `index` | tripwire; Unix 0600 checks; secure Windows endpoint/locks; process-tree cleanup; Linux + Windows full SPEC §11 sign-off |
+
+M3 through M5 run every build, vet, unit, race, and integration gate in the
+pinned Go 1.26.5 Linux Docker environment. M6 keeps that gate and adds a real
+Windows build/test gate; cross-compilation alone does not prove local IPC or
+process-tree cleanup.
 
 **M1 must write `procx.Resolve`'s workspace-tree rejection with its own unit
 test, five milestones before M6's tripwire.** Otherwise five milestones of
@@ -1708,9 +1943,21 @@ index/gc.go                          index/gc_test.go
 index/stablekey.go                   index/stablekey_test.go
 internal/watch/scanner.go            internal/watch/scanner_test.go
 internal/watch/watcher.go            internal/watch/watcher_test.go
+lsp/server.go                        lsp/server_test.go
+lsp/docstate.go                      lsp/docstate_test.go
+lsp/wire/normalize.go                lsp/wire/normalize_test.go
+protocol/status.go                   protocol/status_test.go
+protocol/params.go                   protocol/params_test.go
+internal/workspace/registry.go       internal/workspace/registry_test.go
+internal/workspace/workspace.go      internal/workspace/workspace_test.go
+internal/workspace/query.go          internal/workspace/query_test.go
 internal/workspace/index.go          internal/workspace/index_test.go
 internal/workspace/indexer.go        internal/workspace/indexer_test.go
+daemon/server.go                     daemon/server_test.go
+daemon/sunset.go                     daemon/sunset_test.go
 daemon/gc.go                         daemon/gc_test.go
+daemon/fake_test.go                  daemon/integration_test.go
+internal/procx/run_test.go            (Go 1.26 Getsid baseline repair ONLY)
 cmd/langer/archrules_test.go         (append rules 1 and 3)
 internal/deps/deps.go                (delete 2 lines)
 ```
@@ -1745,8 +1992,18 @@ MCP tool surface.
 ```
 daemon/security_test.go              (tripwire, //go:build integration)
 daemon/perms.go                      daemon/perms_test.go
+daemon/server.go                     daemon/server_test.go
+daemon/lock.go                       daemon/lock_test.go
+daemon/transport_unix.go             daemon/transport_windows.go
 index/perms_test.go
-internal/procx/security_test.go
+internal/daemonctl/client.go          internal/daemonctl/client_test.go
+internal/daemonctl/connect.go         internal/daemonctl/connect_test.go
+internal/daemonctl/transport_unix.go  internal/daemonctl/transport_windows.go
+internal/procx/run.go                 internal/procx/run_test.go
+internal/procx/run_unix.go            internal/procx/run_windows.go
+internal/procx/run_windows_test.go
+internal/procx/security_test.go       (tripwire/process tree)
+config/paths.go                      config/paths_test.go
 PLAN.md                              ("v0.1 verification" section ONLY)
 ```
 
@@ -1941,13 +2198,66 @@ case in `daemon/server_test.go`. M5's remaining criteria (overlay
 isolation between two sessions, overlay diagnostics with nothing written to
 disk) stay with M5.
 
+**10.14 Is `stable_key` a cached-reference identity?**
+The original SPEC/contract said yes; the M3 readiness review demonstrated that
+two unrelated top-level symbols can share name + immediate container + kind.
+**Owner-approved winner: no.** `stable_key` remains stored, descriptive,
+non-unique metadata. Cached references use
+`symbol_key = repo_namespace + "\x1f" + definition_path + "\x1f" + stable_key`,
+and all reads/writes still include the canonical-root-derived workspace ID.
+`repo_namespace` is parsed locally from the resolver-approved system-Git
+`origin` path (normally `<org>/<name>`, preserving deeper paths), with the
+canonical CLI-supplied workspace root — normally cwd — as fallback. A residual
+same-file collision is an explicit cache miss and live-LSP fallback.
+
+**10.15 Who owns cross-file references?**
+The original `PutFile` shape owned symbols, diagnostics, and references
+together. That cannot atomically publish a reference query whose locations span
+many files: whichever file writes last can erase or expose a partial set.
+**Owner-approved winner: split ownership.** `PutFile` atomically replaces
+metadata/symbols/diagnostics for one file.
+`ReplaceReferencesBySymbolKey` atomically publishes one complete reference set.
+`reference_sets` stores the completeness bit; ordered locations live in
+`"references"` as `path + ordinal` rows with no `file_id`. Invalidation marks
+affected sets incomplete, and incomplete workspace-wide answers return
+`NOT_READY`, never partial success.
+
+**10.16 How does indexing avoid watcher/overlay races?**
+**Owner-approved winner: watcher-first, disk-only, double-checked indexing.**
+The watcher reaches ready before scan enumeration and reconciles every
+debounced event batch through `Scanner.List`; a batch records activity and
+invalidates synchronously before queueing. The initial list is also reconciled
+against persisted paths. The indexer reads disk bytes, holds the LSP document
+lock through semantic queries, retains `selectionRange` plus its explicit
+validity bit, and re-hashes/checks the path generation immediately before
+commit. Missing/untrustworthy selection ranges never drive cached reference
+discovery. A mismatch discards and reschedules the job. Overlays are never
+persisted.
+
+**10.17 What is the GC policy?**
+**Owner-approved winner:** attempt hourly; 60-second expiring lease renewed
+every 20 seconds; the seven-day diagnostic horizon invalidates the entire
+per-file semantic snapshot (including an explicitly clean file) so no partial
+cache can masquerade as ready; roots continuously missing for 30 days before
+workspace pruning; VACUUM only at shutdown checkpoint and only above 25%
+reclaimable pages. Snapshot expiry produces `NOT_READY`/live fallback and
+triggers lazy reindex healing. These values are constants driven by the
+injected clock, not wall-time sleeps in tests.
+
+**10.18 Is v0.1 Unix-only?**
+**Owner-approved winner: no.** M3–M5 use pinned Linux Docker while the existing
+Unix-only process/transport code remains. M6 must add Windows process-tree and
+secure local-transport support and run real Windows tests; a cross-compile or a
+Unix-only release declaration does not meet SPEC §11.
+
 ---
 
-## 11. Open questions for the spec owner
+## 11. SPEC additions and owner decisions
 
 These are **[SPEC-ADDITION]**s: this contract freezes an answer so implementers
-are never blocked, but each needs sign-off, and each is cheap to reverse *before*
-the milestone that depends on it ships.
+are never blocked. Item 4 and the M3 operational decisions in §10.14–§10.18
+were explicitly approved by the owner on 2026-07-25; they are no longer pending
+questions. Earlier frozen defaults remain recorded here for traceability.
 
 1. **`initialization_options` in the registry** (§4.1a, needed by **M1**).
    SPEC §3.3 enumerates the declarative fields as "name, command, args, file
@@ -1967,15 +2277,12 @@ the milestone that depends on it ships.
    SPEC §4.2 says "hierarchical outline"; SPEC §4.4's `Symbol` has no
    `children`. Frozen: flat list with derived `container`.
 
-4. **`stable_key` collisions** (affects **M3**).
-   SPEC §5.1 defines `stable_key` as name + container + kind. That is **not
-   unique**: two top-level `handle` functions in different files with no
-   container collide, as do same-named methods on different classes when
-   `container` is only the immediate parent. `get_references` would then return
-   locations from unrelated files and look like a language-server correctness
-   bug. The spec mandates this key, so M3 must **write the test that
-   demonstrates the collision** and raise it with evidence rather than silently
-   adding the file path to the key.
+4. **`stable_key` collisions** (affects **M3**, **APPROVED 2026-07-25**).
+   `stable_key` remains name + container + kind and remains non-unique.
+   `symbol_key` adds normalized repository namespace and workspace-relative
+   definition path, while every operation stays workspace-ID scoped. Tests must
+   prove unrelated duplicate stable keys cannot merge reference sets and that
+   residual ambiguity falls back to live LSP. See §10.14.
 
 5. **Pull-model diagnostics** (affects **M1**, low urgency for v0.1).
    SPEC §4.3 asserts diagnostics are server-pushed. That holds for pyright and

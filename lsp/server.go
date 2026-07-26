@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,12 @@ const (
 //
 // Every method returns a *protocol.Error. A crashed server returns
 // SERVER_CRASHED from every method rather than blocking.
+type IndexSymbol struct {
+	protocol.Symbol
+	SelectionRange    protocol.Range
+	HasSelectionRange bool
+}
+
 type Server interface {
 	// Generation increments on every restart. A caller that cached state
 	// resyncs when it changes.
@@ -61,13 +68,22 @@ type Server interface {
 
 	// WithText runs fn while the server's view of path is text, holding the
 	// per-(server, path) lock for the WHOLE call, and restores the previous
-	// text before releasing (SPEC §4.2 overlay isolation, docs §6.6).
+	// text before releasing (SPEC §4.2 overlay isolation, docs §6.6). The
+	// callback context is scoped to fn and must not be retained or used by work
+	// that outlives fn.
 	WithText(ctx context.Context, path, text string, fn func(ctx context.Context, epoch uint64) error) error
+	// WithDiskText serializes indexing against overlays and live queries. It
+	// presents caller-supplied disk bytes for the callback, marks the callback
+	// context as holding the path lock, then unconditionally restores the
+	// document's prior open/closed state. Its callback context has the same
+	// synchronous-only lifetime as WithText's.
+	WithDiskText(ctx context.Context, path, languageID, text string, fn func(ctx context.Context, epoch uint64) error) error
 
 	Definition(ctx context.Context, path string, pos protocol.Position) ([]protocol.Location, error)
 	References(ctx context.Context, path string, pos protocol.Position, includeDecl bool) ([]protocol.Location, error)
 	Hover(ctx context.Context, path string, pos protocol.Position) (*protocol.Hover, error)
 	DocumentSymbols(ctx context.Context, path string) ([]protocol.Symbol, error)
+	DocumentSymbolsForIndex(ctx context.Context, path string) ([]IndexSymbol, error)
 	WorkspaceSymbols(ctx context.Context, query string, limit int) ([]protocol.Symbol, error)
 	Rename(ctx context.Context, path string, pos protocol.Position, newName string) ([]protocol.FileEdit, error)
 
@@ -80,9 +96,40 @@ type Server interface {
 // session is one generation of a live connection: the transport plus the
 // capabilities the server advertised when it started.
 type session struct {
-	conn       *conn
-	caps       map[string]json.RawMessage
-	generation uint64
+	conn           *conn
+	caps           map[string]json.RawMessage
+	generation     uint64
+	analysis       *analysisState
+	symbolProgress bool
+}
+
+// analysisState belongs to exactly one connection candidate. Keeping progress
+// off the stable server handle prevents late notifications from a failed or
+// replaced connection from blessing a later generation's symbol index.
+type analysisState struct {
+	analyzing atomic.Int64
+	indexed   atomic.Bool
+}
+
+// setAnalyzing records the candidate entering (true) or leaving (false) a
+// workspace analysis pass. Called from that connection's reader goroutine.
+func (a *analysisState) setAnalyzing(active bool) {
+	if active {
+		a.analyzing.Add(1)
+		return
+	}
+	if a.analyzing.Add(-1) < 0 {
+		a.analyzing.Store(0)
+	}
+	// A completed pass means the index is populated. Latched, because later
+	// passes re-analyse an already-indexed workspace.
+	a.indexed.Store(true)
+}
+
+// symbolsIndexed reports whether this generation's workspace-wide symbol
+// queries can be trusted.
+func (sess *session) symbolsIndexed() bool {
+	return !sess.symbolProgress || sess.analysis.indexed.Load()
 }
 
 // server implements Server for one registry entry. The supervisor swaps its
@@ -93,6 +140,9 @@ type server struct {
 
 	docs  *documents
 	diags *diagnostics
+	// mutations orders document changes below restart replay/publication. See
+	// documentMutationGate for the global-before-path lock order.
+	mutations documentMutationGate
 
 	settleQuiet  time.Duration
 	settleBudget time.Duration
@@ -100,62 +150,30 @@ type server struct {
 	mu      sync.RWMutex
 	current *session
 	// down carries the reason the server is unavailable when current is nil.
-	down error
-
-	// gen is read without the lock so Generation never blocks behind a restart.
-	gen atomic.Uint64
-
-	// analyzing is >0 while the server is doing a workspace analysis pass. It
-	// is a counter, not a flag: passes can nest, and a stray end must not
-	// declare the workspace ready early.
-	analyzing atomic.Int64
-	// indexed latches true when a workspace analysis pass first COMPLETES.
-	// Until then this server's idea of the workspace is incomplete.
-	indexed atomic.Bool
-	// symbolProgress is true when the server advertised workDoneProgress on
-	// workspaceSymbolProvider, i.e. it admits that its symbol index is built
-	// asynchronously. pyright does; typescript-language-server answers a plain
-	// `true` and is queryable immediately.
-	symbolProgress atomic.Bool
+	down       error
+	generation uint64
 }
 
-// setAnalyzing records the server entering (true) or leaving (false) a
-// workspace analysis pass. Called from the connection's reader goroutine.
-func (s *server) setAnalyzing(active bool) {
-	if active {
-		s.analyzing.Add(1)
-		return
-	}
-	if s.analyzing.Add(-1) < 0 {
-		s.analyzing.Store(0)
-	}
-	// A completed pass means the index is populated. Latched, because later
-	// passes re-analyse an already-indexed workspace.
-	s.indexed.Store(true)
+func (s *server) Generation() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.generation
 }
-
-// symbolsIndexed reports whether workspace-wide symbol queries can be trusted.
-//
-// It is only ever false for a server that told us its index is built
-// asynchronously and has not yet finished a pass.
-func (s *server) symbolsIndexed() bool {
-	return !s.symbolProgress.Load() || s.indexed.Load()
-}
-
-func (s *server) Generation() uint64 { return s.gen.Load() }
 
 // setSession installs a new generation.
 func (s *server) setSession(sess *session) {
 	s.mu.Lock()
 	s.current = sess
 	s.down = nil
+	s.generation = sess.generation
 	s.mu.Unlock()
-	s.gen.Store(sess.generation)
-	// A restart is a fresh process with an empty index: whatever the dead one
-	// had analysed died with it.
-	s.analyzing.Store(0)
-	s.indexed.Store(false)
-	s.symbolProgress.Store(reportsSymbolProgress(sess.caps))
+}
+
+// resetGenerationState runs before a replacement connection can emit
+// diagnostics. Analysis state is candidate-local and is likewise constructed
+// before newConn starts its reader.
+func (s *server) resetGenerationState() {
+	s.diags.reset()
 }
 
 // reportsSymbolProgress is true when workspaceSymbolProvider is the OBJECT form
@@ -245,10 +263,11 @@ func (s *server) require(capability, tool string) (*session, error) {
 
 // Open sends didOpen and returns the diagnostics epoch to settle against.
 func (s *server) Open(ctx context.Context, path, languageID, text string) (uint64, error) {
-	sess, err := s.live()
+	ctx, unlockMutation, err := s.lockDocumentMutation(ctx)
 	if err != nil {
 		return 0, err
 	}
+	defer unlockMutation()
 
 	doc, err := s.lockDoc(ctx, path)
 	if err != nil {
@@ -256,16 +275,22 @@ func (s *server) Open(ctx context.Context, path, languageID, text string) (uint6
 	}
 	defer s.unlockDoc(ctx, doc)
 
-	if _, _, _, open := s.docs.state(path); open {
+	sess, err := s.live()
+	if err != nil {
+		return 0, err
+	}
+
+	if _, version, _, open := s.docs.state(path); open {
 		// Already open: no new push is coming, so settle against what the
 		// server has already told us about this file.
-		return s.diags.current(path), nil
+		return s.diags.currentForVersion(path, version), nil
 	}
 
 	// The mark must be taken BEFORE the notification, or a push racing us could
 	// satisfy the wait with pre-edit results.
 	epoch := s.diags.mark()
 	version := s.docs.markOpen(path, languageID, text)
+	s.diags.invalidate(path)
 
 	if err := sess.conn.notify("textDocument/didOpen", map[string]any{
 		"textDocument": map[string]any{
@@ -283,6 +308,12 @@ func (s *server) Open(ctx context.Context, path, languageID, text string) (uint6
 
 // Close sends didClose. Closing a document that is not open succeeds.
 func (s *server) Close(ctx context.Context, path string) error {
+	ctx, unlockMutation, err := s.lockDocumentMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockMutation()
+
 	doc, err := s.lockDoc(ctx, path)
 	if err != nil {
 		return err
@@ -293,6 +324,7 @@ func (s *server) Close(ctx context.Context, path string) error {
 		return nil
 	}
 	s.docs.markClosed(path)
+	s.diags.invalidate(path)
 
 	sess, err := s.live()
 	if err != nil {
@@ -306,11 +338,16 @@ func (s *server) Close(ctx context.Context, path string) error {
 
 // WithText is how SPEC §4.2's per-session overlays are made isolated without a
 // second language server process (docs §6.6).
-func (s *server) WithText(ctx context.Context, path, text string, fn func(context.Context, uint64) error) error {
-	sess, err := s.live()
+func (s *server) WithText(
+	ctx context.Context,
+	path, text string,
+	fn func(context.Context, uint64) error,
+) (retErr error) {
+	ctx, unlockMutation, err := s.lockDocumentMutation(ctx)
 	if err != nil {
 		return err
 	}
+	defer unlockMutation()
 
 	doc, err := s.lockDoc(ctx, path)
 	if err != nil {
@@ -318,29 +355,168 @@ func (s *server) WithText(ctx context.Context, path, text string, fn func(contex
 	}
 	defer s.unlockDoc(ctx, doc)
 
+	// Resolve the session only after both mutation locks. A restart may have
+	// completed while this call waited for another operation on the same path.
+	sess, err := s.live()
+	if err != nil {
+		return err
+	}
+
 	base, _, _, open := s.docs.state(path)
 	if !open {
 		return protocol.NewErrorf(protocol.ErrNotReady,
 			"%s must be open before a speculative edit", path)
 	}
 
+	// pushText records the new local version before writing didChange. Arm the
+	// restore first so a transport failure during that write cannot leave the
+	// authoritative snapshot holding speculative bytes.
+	defer func() {
+		restoreErr := s.restoreAfterText(sess, path, base)
+		if retErr == nil && restoreErr != nil {
+			retErr = restoreErr
+		}
+	}()
+
 	epoch, err := s.pushText(sess, path, text)
 	if err != nil {
 		return err
 	}
+	return callWithDocLock(ctx, path, epoch, fn)
+}
 
-	// The restore is unconditional and uncancellable. A document write
-	// abandoned half way leaves the server's version of this file permanently
-	// desynced from ours, and every later answer for it is silently wrong — no
-	// error, no crash (docs/ARCHITECTURE.md §6.3 rule 1). Reviewers will read
-	// this as "ignoring the context"; it is deliberate.
+func (s *server) restoreAfterText(original *session, path, base string) error {
+	// Restore local state first and unconditionally. If the original generation
+	// died, the writer waiting on the mutation gate will replay this base text
+	// before it publishes the replacement session.
+	version := s.docs.markChanged(path, base)
+	s.diags.invalidate(path)
+	live, err := s.live()
+	if err != nil || live != original {
+		return nil
+	}
+	return live.conn.notify("textDocument/didChange", map[string]any{
+		"textDocument":   map[string]any{"uri": wire.PathToURI(s.root, path), "version": version},
+		"contentChanges": []any{map[string]any{"text": base}},
+	})
+}
+
+// WithDiskText gives the M3 indexer a document view made exclusively from disk
+// bytes while holding the same per-path lock as speculative overlays. A file
+// that was implicitly opened for indexing is always closed again; a file that
+// was already open gets its original text and language state back.
+func (s *server) WithDiskText(
+	ctx context.Context,
+	path, languageID, text string,
+	fn func(context.Context, uint64) error,
+) (retErr error) {
+	ctx, unlockMutation, err := s.lockDocumentMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockMutation()
+
+	doc, err := s.lockDoc(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer s.unlockDoc(ctx, doc)
+
+	sess, err := s.live()
+	if err != nil {
+		return err
+	}
+
+	baseText, baseVersion, baseLanguageID, wasOpen := s.docs.state(path)
+	if wasOpen && baseText == text && strings.EqualFold(baseLanguageID, languageID) {
+		// The language server is already analyzing exactly this document view.
+		// Sending a no-op didChange would reserve a future diagnostics epoch
+		// that many servers never publish, making the indexer time out against
+		// diagnostics that were current before this call.
+		return callWithDocLock(ctx, path, s.diags.currentForVersion(path, baseVersion), fn)
+	}
 	defer func() {
-		if live, err := s.live(); err == nil {
-			_, _ = s.pushText(live, path, base)
+		restoreErr := s.restoreAfterDiskText(sess.generation, path, baseText, baseLanguageID, wasOpen)
+		if retErr == nil && restoreErr != nil {
+			retErr = restoreErr
 		}
 	}()
 
-	return fn(withDocLock(ctx, path), epoch)
+	var epoch uint64
+	if wasOpen {
+		epoch, err = s.pushText(sess, path, text)
+	} else {
+		epoch = s.diags.mark()
+		version := s.docs.markOpen(path, languageID, text)
+		s.diags.invalidate(path)
+		err = sess.conn.notify("textDocument/didOpen", map[string]any{
+			"textDocument": map[string]any{
+				"uri":        wire.PathToURI(s.root, path),
+				"languageId": languageID,
+				"version":    version,
+				"text":       text,
+			},
+		})
+	}
+	if err != nil {
+		return err
+	}
+
+	return callWithDocLock(ctx, path, epoch, fn)
+}
+
+func callWithDocLock(
+	ctx context.Context,
+	path string,
+	epoch uint64,
+	fn func(context.Context, uint64) error,
+) error {
+	ctx, release := withDocLock(ctx, path)
+	defer release()
+	return fn(ctx, epoch)
+}
+
+// restoreAfterDiskText updates our document snapshot before touching the
+// connection. If the server died during the callback, a replacement generation
+// therefore resyncs the original state rather than the temporary disk view.
+func (s *server) restoreAfterDiskText(
+	generation uint64,
+	path, baseText, baseLanguageID string,
+	wasOpen bool,
+) error {
+	if wasOpen {
+		version := s.docs.markChanged(path, baseText)
+		s.diags.invalidate(path)
+		sess, err := s.live()
+		if err != nil {
+			// The local snapshot is authoritative across restarts. If this
+			// generation died, the replacement will replay the restored text
+			// before it becomes visible to callers.
+			return nil
+		}
+		if sess.generation != generation {
+			return nil
+		}
+		return sess.conn.notify("textDocument/didChange", map[string]any{
+			"textDocument":   map[string]any{"uri": wire.PathToURI(s.root, path), "version": version},
+			"contentChanges": []any{map[string]any{"text": baseText}},
+		})
+	}
+
+	s.docs.restoreClosed(path, baseLanguageID)
+	s.diags.invalidate(path)
+	sess, err := s.live()
+	if err != nil {
+		// As above, a replacement generation will observe the restored closed
+		// state during its serialized resync.
+		return nil
+	}
+	if sess.generation != generation {
+		return nil
+	}
+	return sess.conn.notify("textDocument/didClose", map[string]any{
+		"textDocument": map[string]any{"uri": wire.PathToURI(s.root, path)},
+	})
 }
 
 // pushText sends a full-document didChange and returns the epoch to settle
@@ -348,6 +524,7 @@ func (s *server) WithText(ctx context.Context, path, text string, fn func(contex
 func (s *server) pushText(sess *session, path, text string) (uint64, error) {
 	epoch := s.diags.mark()
 	version := s.docs.markChanged(path, text)
+	s.diags.invalidate(path)
 	err := sess.conn.notify("textDocument/didChange", map[string]any{
 		"textDocument":   map[string]any{"uri": wire.PathToURI(s.root, path), "version": version},
 		"contentChanges": []any{map[string]any{"text": text}},
@@ -369,6 +546,25 @@ func (s *server) unlockDoc(_ context.Context, doc *document) {
 	if doc != nil {
 		s.docs.release(doc)
 	}
+}
+
+func (s *server) lockDocumentMutation(
+	ctx context.Context,
+) (context.Context, func(), error) {
+	if holdsDocumentMutationGate(ctx, s) {
+		return ctx, func() {}, nil
+	}
+	if err := s.mutations.readLock(ctx); err != nil {
+		return ctx, nil, err
+	}
+	lease := &documentMutationLease{}
+	lease.active.Store(true)
+	unlock := func() {
+		if lease.active.Swap(false) {
+			s.mutations.readUnlock()
+		}
+	}
+	return withDocumentMutationGate(ctx, s, lease), unlock, nil
 }
 
 // ---- queries ----
@@ -457,7 +653,7 @@ func (s *server) Hover(ctx context.Context, path string, pos protocol.Position) 
 	return wire.SplitHover(rawHover.Value, rng), nil
 }
 
-func (s *server) DocumentSymbols(ctx context.Context, path string) ([]protocol.Symbol, error) {
+func (s *server) documentSymbolsForIndex(ctx context.Context, path string) ([]wire.NormalizedSymbol, error) {
 	sess, err := s.require(CapDocumentSymbol, "document_symbols")
 	if err != nil {
 		return nil, err
@@ -473,7 +669,35 @@ func (s *server) DocumentSymbols(ctx context.Context, path string) ([]protocol.S
 	if err != nil {
 		return nil, protocol.NewErrorf(protocol.ErrInternal, "decoding documentSymbol result: %v", err)
 	}
-	return wire.FlattenSymbols(s.root, path, raws), nil
+	return wire.FlattenSymbolsForIndex(s.root, path, raws), nil
+}
+
+func (s *server) DocumentSymbols(ctx context.Context, path string) ([]protocol.Symbol, error) {
+	normalized, err := s.documentSymbolsForIndex(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.Symbol, 0, len(normalized))
+	for _, symbol := range normalized {
+		out = append(out, symbol.Symbol)
+	}
+	return out, nil
+}
+
+func (s *server) DocumentSymbolsForIndex(ctx context.Context, path string) ([]IndexSymbol, error) {
+	normalized, err := s.documentSymbolsForIndex(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IndexSymbol, 0, len(normalized))
+	for _, symbol := range normalized {
+		out = append(out, IndexSymbol{
+			Symbol:            symbol.Symbol,
+			SelectionRange:    symbol.SelectionRange,
+			HasSelectionRange: symbol.HasSelectionRange,
+		})
+	}
+	return out, nil
 }
 
 func (s *server) WorkspaceSymbols(ctx context.Context, query string, limit int) ([]protocol.Symbol, error) {
@@ -503,7 +727,7 @@ func (s *server) WorkspaceSymbols(ctx context.Context, query string, limit int) 
 	//
 	// Only the EMPTY case is converted. Real results are always returned, even
 	// mid-analysis, because a partial answer is still a true answer.
-	if len(symbols) == 0 && !s.symbolsIndexed() {
+	if len(symbols) == 0 && !sess.symbolsIndexed() {
 		return nil, protocol.NewErrorf(protocol.ErrNotReady,
 			"%s is still building its workspace symbol index", s.name).WithRetryAfterMS(300)
 	}

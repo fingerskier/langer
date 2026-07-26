@@ -62,6 +62,11 @@ type Options struct {
 	BackoffInitial    time.Duration
 	BackoffMax        time.Duration
 	HealthyResetAfter time.Duration
+
+	// beforePublish is an in-package test seam for the narrow boundary after
+	// replay and before replacement-session publication. External callers
+	// cannot set it.
+	beforePublish func(generation uint64)
 }
 
 func (o *Options) applyDefaults() {
@@ -128,6 +133,28 @@ type supervisor struct {
 
 // managed is one registry entry's supervision state plus the Server handle
 // callers hold across restarts.
+// startWorkers atomically reserves every worker before Shutdown can begin
+// waiting. sync.WaitGroup forbids Add racing a Wait that observed a zero
+// count; using the supervisor lifecycle mutex makes that rule structural.
+func (s *supervisor) startWorkers(workers ...func()) bool {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return false
+	}
+	s.wg.Add(len(workers))
+	s.mu.Unlock()
+
+	for _, worker := range workers {
+		worker := worker
+		go func() {
+			defer s.wg.Done()
+			worker()
+		}()
+	}
+	return true
+}
+
 type managed struct {
 	sup   *supervisor
 	entry config.LanguageServer
@@ -144,7 +171,104 @@ type managed struct {
 	generation uint64
 	proc       procx.Process
 	conn       *conn
+	candidate  *connectionCandidate
 	stderrDone chan struct{}
+}
+
+// connectionCandidate owns notifications that must never bleed across process
+// generations. Analysis progress is inherently candidate-local. Diagnostics
+// remain disabled until replay has completed and publication is imminent, and
+// deactivate waits out an in-flight publish before the next candidate resets
+// the shared diagnostics cache.
+type connectionCandidate struct {
+	mu       sync.Mutex
+	active   bool
+	armed    map[string]bool
+	pending  map[string]candidateDiagnostics
+	analysis analysisState
+}
+
+type candidateDiagnostics struct {
+	values    []protocol.Diagnostic
+	version   int
+	versioned bool
+}
+
+func (c *connectionCandidate) onDiagnostics(
+	m *managed,
+	uri string,
+	version *int,
+	raws []wire.RawDiagnostic,
+) {
+	rel, ok := wire.URIToPath(m.sup.opts.Root, uri)
+	if !ok {
+		return // a dependency file: never indexed, never reported (SPEC Â§3.4)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active && !c.armed[rel] {
+		return
+	}
+	diags, err := wire.ToDiagnostics(m.sup.opts.Root, raws)
+	if err != nil {
+		return
+	}
+	_, currentVersion, _, open := m.srv.docs.state(rel)
+	if !open || version != nil && *version != currentVersion {
+		return
+	}
+	entry := candidateDiagnostics{values: diags}
+	if version != nil {
+		entry.version = *version
+		entry.versioned = true
+	}
+	if c.active {
+		entry.publish(m.srv.diags, rel)
+		return
+	}
+	c.pending[rel] = entry
+}
+
+// arm preserves diagnostics that can be causally attributed to the replayed
+// didOpen. Initialize-time disk diagnostics are discarded because no path is
+// armed yet; a push arriving while the one-way didOpen write is in flight is
+// buffered because it may be the server's only response to that replay.
+func (c *connectionCandidate) arm(path string) {
+	c.mu.Lock()
+	if c.armed == nil {
+		c.armed = make(map[string]bool)
+		c.pending = make(map[string]candidateDiagnostics)
+	}
+	c.armed[path] = true
+	delete(c.pending, path)
+	c.mu.Unlock()
+}
+
+func (c *connectionCandidate) activate(diags *diagnostics) {
+	c.mu.Lock()
+	for path, entry := range c.pending {
+		entry.publish(diags, path)
+	}
+	c.active = true
+	c.armed = nil
+	c.pending = nil
+	c.mu.Unlock()
+}
+
+func (d candidateDiagnostics) publish(cache *diagnostics, path string) {
+	if d.versioned {
+		cache.publishVersioned(path, d.version, d.values)
+		return
+	}
+	cache.publish(path, d.values)
+}
+
+func (c *connectionCandidate) deactivate() {
+	c.mu.Lock()
+	c.active = false
+	c.armed = nil
+	c.pending = nil
+	c.mu.Unlock()
 }
 
 func (s *supervisor) Acquire(ctx context.Context, languageID string) (Server, error) {
@@ -320,18 +444,29 @@ func (m *managed) ensureReady(ctx context.Context) error {
 // startAttempt runs one start synchronously and records the outcome. The caller
 // has already put the state machine in ServerStarting and owns m.ready.
 func (m *managed) startAttempt() {
+	m.mu.Lock()
+	ready := m.ready
+	m.mu.Unlock()
+
 	err := m.start()
 
 	m.mu.Lock()
-	m.startErr = err
-	if err == nil {
-		m.state = protocol.ServerReady
-		m.readySince = m.sup.opts.Clock.Now()
-	} else {
-		m.state = protocol.ServerCrashed
+	if m.ready == ready {
+		m.startErr = err
+		// A connection can close asynchronously while start or resync is in
+		// flight. Preserve the backoff/stopped state installed by that event
+		// instead of publishing a dead generation as ready.
+		if m.state == protocol.ServerStarting {
+			if err == nil {
+				m.state = protocol.ServerReady
+				m.readySince = m.sup.opts.Clock.Now()
+			} else {
+				m.state = protocol.ServerCrashed
+			}
+		}
 	}
-	close(m.ready)
 	m.mu.Unlock()
+	close(ready)
 
 	if err != nil {
 		m.sup.log.Warn("language server failed to start", "server", m.entry.Name, "error", err)
@@ -359,30 +494,58 @@ func (m *managed) start() error {
 		return protocol.NewErrorf(protocol.ErrInternal, "starting %s: %v", m.entry.Name, err)
 	}
 
-	// An unread stderr pipe fills at 64 KiB and blocks the language server
-	// forever; pyright reaches that on a real project.
-	stderrDone := make(chan struct{})
-	sup.wg.Add(1)
-	go func() {
-		defer sup.wg.Done()
-		defer close(stderrDone)
-		m.drainStderr(proc.Stderr())
-	}()
-
+	// A replacement is a fresh analysis generation. Reset before newConn starts
+	// its reader: initialize/initialized may immediately trigger progress or
+	// diagnostics, and resetting at publication would erase those events.
+	m.srv.resetGenerationState()
+	candidate := &connectionCandidate{}
+	registered := make(chan *conn, 1)
 	c := newConn(procStdio{proc}, connHandlers{
-		diagnostics: m.onDiagnostics,
-		closed:      func(cause error) { m.onConnectionClosed(cause) },
-		analyzing:   m.srv.setAnalyzing,
+		diagnostics: func(uri string, version *int, raws []wire.RawDiagnostic) {
+			candidate.onDiagnostics(m, uri, version, raws)
+		},
+		closed: func(cause error) {
+			m.onConnectionClosed(<-registered, candidate, cause)
+		},
+		analyzing: candidate.analysis.setAnalyzing,
 	}).withLogger(sup.log.With("server", m.entry.Name))
 
-	// The waiter turns a process exit into a state change and nothing more:
-	// SPEC §8 forbids a language server crash from reaching the daemon.
-	sup.wg.Add(1)
-	go func() {
-		defer sup.wg.Done()
+	// Reserve both process-lifetime workers together before exposing the process
+	// through m.proc. Besides making Add-vs-Wait safe, this ensures shutdown can
+	// never miss an untracked process started concurrently with it. An unread
+	// stderr pipe fills at 64 KiB and blocks pyright, so draining is mandatory.
+	stderrDone := make(chan struct{})
+	if !sup.startWorkers(
+		func() {
+			defer close(stderrDone)
+			m.drainStderr(proc.Stderr())
+		},
+		func() {
+			_ = proc.Wait()
+			c.close(errors.New("language server process exited"))
+		},
+	) {
+		c.close(errors.New("language server supervisor is shutting down"))
+		_ = proc.Kill()
 		_ = proc.Wait()
-		c.close(errors.New("language server process exited"))
-	}()
+		c.wait()
+		return protocol.NewError(protocol.ErrServerCrashed, "language server supervisor is shutting down")
+	}
+
+	m.mu.Lock()
+	if m.state != protocol.ServerStarting {
+		m.mu.Unlock()
+		registered <- c
+		c.close(errors.New("language server start was cancelled"))
+		_ = proc.Kill()
+		return protocol.NewError(protocol.ErrServerCrashed, "language server start was cancelled")
+	}
+	m.proc = proc
+	m.conn = c
+	m.candidate = candidate
+	m.stderrDone = stderrDone
+	m.mu.Unlock()
+	registered <- c
 
 	caps, err := m.initialize(c)
 	if err != nil {
@@ -392,27 +555,70 @@ func (m *managed) start() error {
 	}
 
 	m.mu.Lock()
+	if m.state != protocol.ServerStarting || m.conn != c || m.candidate != candidate {
+		m.mu.Unlock()
+		c.close(errors.New("language server connection closed during initialization"))
+		_ = proc.Kill()
+		return protocol.NewError(protocol.ErrServerCrashed, "language server connection closed during initialization")
+	}
 	m.generation++
 	generation := m.generation
-	m.proc = proc
-	m.conn = c
-	m.stderrDone = stderrDone
 	m.mu.Unlock()
 
-	m.srv.diags.reset()
-	m.srv.setSession(&session{conn: c, caps: caps, generation: generation})
+	if err := m.srv.mutations.writeLock(sup.ctx); err != nil {
+		c.close(err)
+		_ = proc.Kill()
+		return err
+	}
+
+	// After a restart the server has no memory of our open documents; ours is
+	// the only copy left. Do not expose the replacement session until this
+	// barrier completes: callers holding an old Server handle must not query a
+	// half-resynchronized process.
+	if generation > 1 {
+		if err := m.resync(c, candidate); err != nil {
+			m.srv.mutations.writeUnlock()
+			c.close(err)
+			_ = proc.Kill()
+			return err
+		}
+	}
+	if sup.opts.beforePublish != nil {
+		sup.opts.beforePublish(generation)
+	}
+	sess := &session{
+		conn:           c,
+		caps:           caps,
+		generation:     generation,
+		analysis:       &candidate.analysis,
+		symbolProgress: reportsSymbolProgress(caps),
+	}
+	m.mu.Lock()
+	select {
+	case <-c.done:
+		err = crashedError(c.closeCause())
+	default:
+		if m.state != protocol.ServerStarting || m.conn != c || m.candidate != candidate {
+			err = protocol.NewError(protocol.ErrServerCrashed, "language server connection closed before publication")
+		} else {
+			candidate.activate(m.srv.diags)
+			m.srv.setSession(sess)
+		}
+	}
+	m.mu.Unlock()
+	if err != nil {
+		m.srv.mutations.writeUnlock()
+		c.close(err)
+		_ = proc.Kill()
+		return err
+	}
+	m.srv.mutations.writeUnlock()
 
 	sup.log.Info("language server ready",
 		"server", m.entry.Name,
 		"generation", generation,
 		"pid", proc.PID(),
 		"capabilities", strings.Join(sortedCapabilityNames(caps), ","))
-
-	// After a restart the server has no memory of our open documents; ours is
-	// the only copy left.
-	if generation > 1 {
-		m.resync(c)
-	}
 	return nil
 }
 
@@ -508,33 +714,39 @@ func symbolKindValueSet() []int {
 	return set
 }
 
-// onDiagnostics runs on the connection's reader goroutine and must not block.
-func (m *managed) onDiagnostics(uri string, raws []wire.RawDiagnostic) {
-	rel, ok := wire.URIToPath(m.sup.opts.Root, uri)
-	if !ok {
-		return // a dependency file: never indexed, never reported (SPEC §3.4)
-	}
-	diags, err := wire.ToDiagnostics(m.sup.opts.Root, raws)
-	if err != nil {
-		return
-	}
-	m.srv.diags.publish(rel, diags)
-}
-
 // onConnectionClosed is crash detection. It cancels nothing above this server,
 // which is exactly why SPEC §8 holds.
-func (m *managed) onConnectionClosed(cause error) {
+func (m *managed) onConnectionClosed(
+	closed *conn,
+	candidate *connectionCandidate,
+	cause error,
+) {
+	m.mu.Lock()
+	candidate.deactivate()
+	if m.conn != closed || m.candidate != candidate {
+		m.mu.Unlock()
+		return
+	}
+	proc := m.proc
+	m.proc = nil
+	m.conn = nil
+	m.candidate = nil
 	m.srv.clearSession(cause)
 
-	m.mu.Lock()
 	if m.state == protocol.ServerStopped {
 		// Deliberate shutdown, not a crash.
 		m.mu.Unlock()
+		if proc != nil {
+			_ = proc.Kill()
+		}
 		return
 	}
 	if m.sup.isClosing() {
 		m.state = protocol.ServerStopped
 		m.mu.Unlock()
+		if proc != nil {
+			_ = proc.Kill()
+		}
 		return
 	}
 
@@ -554,18 +766,25 @@ func (m *managed) onConnectionClosed(cause error) {
 	m.retryAt = m.sup.opts.Clock.Now().Add(delay)
 	m.readySince = time.Time{}
 	restarts := m.restarts
+	attemptReady := m.ready
 	m.mu.Unlock()
+	if proc != nil {
+		_ = proc.Kill()
+	}
 
 	m.sup.log.Warn("language server crashed; scheduling restart",
 		"server", m.entry.Name, "restart", restarts, "backoff", delay, "cause", cause)
 
-	m.sup.wg.Add(1)
-	go func() {
-		defer m.sup.wg.Done()
+	m.sup.startWorkers(func() {
 		if err := m.sup.opts.Clock.Sleep(m.sup.ctx, delay); err != nil {
 			return // the supervisor is shutting down
 		}
 		if m.sup.isClosing() {
+			return
+		}
+		select {
+		case <-attemptReady:
+		case <-m.sup.shutdown:
 			return
 		}
 
@@ -579,25 +798,42 @@ func (m *managed) onConnectionClosed(cause error) {
 		m.mu.Unlock()
 
 		m.startAttempt()
-	}()
+	})
 }
 
 // resync re-opens every document the previous generation knew about.
-func (m *managed) resync(c *conn) {
-	for _, doc := range m.srv.docs.openSnapshot() {
-		version := m.srv.docs.markChanged(doc.Path, doc.Text)
-		if err := c.notify("textDocument/didOpen", map[string]any{
+func (m *managed) resync(c *conn, candidate *connectionCandidate) error {
+	for _, snapshot := range m.srv.docs.openSnapshot() {
+		doc, err := m.srv.docs.acquire(m.sup.ctx, snapshot.Path)
+		if err != nil {
+			return protocol.NewErrorf(protocol.ErrNotReady,
+				"locking %s for %s resync: %v", snapshot.Path, m.entry.Name, err)
+		}
+
+		text, _, languageID, open := m.srv.docs.state(snapshot.Path)
+		if !open {
+			m.srv.docs.release(doc)
+			continue
+		}
+
+		version := m.srv.docs.markChanged(snapshot.Path, text)
+		m.srv.diags.invalidate(snapshot.Path)
+		candidate.arm(snapshot.Path)
+		err = c.notify("textDocument/didOpen", map[string]any{
 			"textDocument": map[string]any{
-				"uri":        wire.PathToURI(m.sup.opts.Root, doc.Path),
-				"languageId": doc.LanguageID,
+				"uri":        wire.PathToURI(m.sup.opts.Root, snapshot.Path),
+				"languageId": languageID,
 				"version":    version,
-				"text":       doc.Text,
+				"text":       text,
 			},
-		}); err != nil {
-			m.sup.log.Warn("resync failed", "server", m.entry.Name, "path", doc.Path, "error", err)
-			return
+		})
+		m.srv.docs.release(doc)
+		if err != nil {
+			return protocol.NewErrorf(protocol.ErrServerCrashed,
+				"resyncing %s in %s: %v", snapshot.Path, m.entry.Name, err)
 		}
 	}
+	return nil
 }
 
 func (m *managed) drainStderr(r io.Reader) {
@@ -654,8 +890,12 @@ func (s *supervisor) Shutdown(ctx context.Context) error {
 // stop performs shutdown → exit → Wait → Kill for one server.
 func (m *managed) stop(ctx context.Context) error {
 	m.mu.Lock()
-	proc, c := m.proc, m.conn
+	proc, c, candidate := m.proc, m.conn, m.candidate
+	if candidate != nil {
+		candidate.deactivate()
+	}
 	m.proc, m.conn = nil, nil
+	m.candidate = nil
 	m.state = protocol.ServerStopped
 	m.mu.Unlock()
 
