@@ -49,7 +49,7 @@ Restart Claude/Codex after install. For Grok, restart or press `r` in `/mcps`.
 ### From source / Go toolchain
 
 ```bash
-go install github.com/fingerskier/langer/cmd/langer@v0.1.0
+go install github.com/fingerskier/langer/cmd/langer@v0.1.1
 ```
 
 Put `$(go env GOPATH)/bin` on your `PATH`, then register MCP yourself:

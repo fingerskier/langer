@@ -18,6 +18,11 @@ passes `--version`:
 |--------------------------------|----------------------------|
 | `0.1.1` | `v0.1.1` → `…/releases/download/v0.1.1/langer_<os>_<arch>[.exe]` |
 
+If the versioned URL 404s and the user did **not** pass `--version`, the
+installer also tries
+`…/releases/latest/download/langer_<os>_<arch>[.exe]` so a stale npm patch
+can still grab the newest GH assets.
+
 Keep those two numbers aligned whenever you publish.
 
 ## Release assets (GitHub Actions)
