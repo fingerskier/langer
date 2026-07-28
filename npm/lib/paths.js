@@ -23,6 +23,11 @@ export function binaryInstallDir(home = homedir()) {
   return path.join(home, ".langer", "bin");
 }
 
+/** Managed language-server tools root (mirrors Go tools.DefaultToolsDir). */
+export function toolsInstallDir(home = homedir()) {
+  return path.join(home, ".langer", "tools");
+}
+
 export function binaryName(platform = process.platform) {
   return platform === "win32" ? "langer.exe" : "langer";
 }

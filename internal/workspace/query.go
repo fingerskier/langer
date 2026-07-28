@@ -15,6 +15,7 @@ import (
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/lsp/wire"
 	"github.com/fingerskier/langer/protocol"
+	"github.com/fingerskier/langer/tools"
 )
 
 // maxDocumentBytes bounds what the daemon will read into memory and push to a
@@ -122,17 +123,40 @@ func (w *Workspace) hasRootMarker(entry config.LanguageServer) bool {
 // ---- language server selection --------------------------------------------
 
 // serverFor acquires the language server that claims path's extension.
+// User config wins; otherwise managed tools ensure a pinned install.
 func (w *Workspace) serverFor(ctx context.Context, rel string) (lsp.Server, error) {
-	entry, ok := w.cfg.LanguageServerForFile(rel)
-	if !ok {
-		return nil, protocol.NewErrorf(protocol.ErrUnsupported,
-			"no language server is configured for %s", filepath.Ext(rel))
+	entry, err := w.resolveLanguageServer(ctx, rel)
+	if err != nil {
+		return nil, err
 	}
+	w.sup.Offer(entry)
 	srv, err := w.sup.Acquire(ctx, entry.Name)
 	if err != nil {
 		return nil, protocol.AsError(err)
 	}
 	return srv, nil
+}
+
+// resolveLanguageServer returns the registry entry for rel (user or managed).
+func (w *Workspace) resolveLanguageServer(ctx context.Context, rel string) (config.LanguageServer, error) {
+	if w.tools != nil {
+		entry, err := w.tools.ResolveEntry(ctx, rel, w.cfg)
+		if err != nil {
+			return config.LanguageServer{}, err
+		}
+		return entry, nil
+	}
+	entry, ok := w.cfg.LanguageServerForFile(rel)
+	if !ok {
+		return config.LanguageServer{}, protocol.NewErrorf(protocol.ErrUnsupported,
+			"no language server for %s", filepath.Ext(rel))
+	}
+	return entry, nil
+}
+
+// coversFile reports whether user config or an enabled managed profile claims rel.
+func (w *Workspace) coversFile(rel string) bool {
+	return tools.ClaimsExtension(w.cfg, w.tools, rel)
 }
 
 // languageIDFor maps a file extension onto the LSP language identifier a
@@ -154,9 +178,28 @@ func (w *Workspace) languageIDFor(rel string) string {
 		return "go"
 	case ".rs":
 		return "rust"
+	case ".md", ".mdx":
+		return "markdown"
+	case ".html", ".htm":
+		return "html"
+	case ".css", ".scss":
+		return "css"
+	case ".json", ".jsonc":
+		return "json"
+	case ".xml":
+		return "xml"
+	case ".cs":
+		return "csharp"
+	case ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh":
+		return "cpp"
 	}
 	if entry, ok := w.cfg.LanguageServerForFile(rel); ok {
 		return entry.Name
+	}
+	if w.tools != nil {
+		if id, _, ok := w.tools.Manifest.ProfileForExtension(filepath.Ext(rel)); ok {
+			return id
+		}
 	}
 	return "plaintext"
 }

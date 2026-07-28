@@ -184,7 +184,7 @@ func (w *Workspace) indexablePaths(paths []string) []string {
 		if err := w.validateWorkspaceFile(rel); err != nil {
 			continue
 		}
-		if _, ok := w.cfg.LanguageServerForFile(rel); !ok {
+		if !w.coversFile(rel) {
 			continue
 		}
 		set[rel] = struct{}{}
@@ -274,7 +274,7 @@ func (w *Workspace) handleWatchBatch(batch watch.Batch) {
 			}
 			continue
 		}
-		if _, ok := w.cfg.LanguageServerForFile(rel); !ok {
+		if !w.coversFile(rel) {
 			if err := w.deleteIndexedPath(w.indexCtx, rel); err != nil {
 				w.failIndexPath(rel, err)
 			}
@@ -516,7 +516,7 @@ func (w *Workspace) invalidateAndQueue(ctx context.Context, rel string, admit bo
 	if w.store == nil {
 		return nil
 	}
-	if _, ok := w.cfg.LanguageServerForFile(rel); !ok {
+	if !w.coversFile(rel) {
 		return w.deleteIndexedPath(ctx, rel)
 	}
 	unlock, err := w.lockDoc(ctx, rel)

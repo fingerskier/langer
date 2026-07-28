@@ -12,6 +12,7 @@ import (
 	"github.com/fingerskier/langer/internal/watch"
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/protocol"
+	"github.com/fingerskier/langer/tools"
 )
 
 // maxRememberedPlans bounds the rename dry-run plans a workspace keeps. A plan
@@ -27,6 +28,7 @@ type Workspace struct {
 	id    protocol.WorkspaceID
 	root  string
 	cfg   *config.Config
+	tools *tools.Manager
 	sup   lsp.Supervisor
 	log   *slog.Logger
 	clock clock.Clock
@@ -135,6 +137,7 @@ func newWorkspace(ctx context.Context, id protocol.WorkspaceID, root string, opt
 		id:             id,
 		root:           root,
 		cfg:            opts.Config,
+		tools:          opts.Tools,
 		sup:            sup,
 		log:            log,
 		clock:          opts.Clock,

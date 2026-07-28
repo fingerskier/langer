@@ -26,6 +26,7 @@ import (
 	"github.com/fingerskier/langer/internal/watch"
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/protocol"
+	"github.com/fingerskier/langer/tools"
 )
 
 // RegistryOptions configures a Registry.
@@ -45,6 +46,9 @@ type RegistryOptions struct {
 	NewWatcher     func(root string, sc watch.Scanner, ck clock.Clock, debounce time.Duration) (watch.Watcher, error)
 	OnFileActivity func()
 	NewSupervisor  func(lsp.Options) (lsp.Supervisor, error)
+	// Tools manages lazy language-server installs under ~/.langer/tools.
+	// When nil, only user-configured language_servers are used.
+	Tools *tools.Manager
 	// OverlayTTL is how long a session's speculative text lives without use
 	// (SPEC §4.2). Zero means defaultOverlayTTL (5 minutes).
 	OverlayTTL time.Duration

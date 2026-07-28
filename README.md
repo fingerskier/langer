@@ -33,7 +33,7 @@ npx -y @fingerskier/langer install all --scope user
 npx -y @fingerskier/langer install all --scope user
 ```
 
-Options: `--scope repo`, `--dry-run`, `--force`, `--binary PATH`, `--version 0.1.0`.  
+Options: `--scope repo`, `--dry-run`, `--force`, `--binary PATH`, `--version 0.7.0`.  
 Details: [`npm/README.md`](npm/README.md).
 
 Restart Claude/Codex after install. For Grok, restart or press `r` in `/mcps`.
@@ -49,7 +49,7 @@ Restart Claude/Codex after install. For Grok, restart or press `r` in `/mcps`.
 ### From source / Go toolchain
 
 ```bash
-go install github.com/fingerskier/langer/cmd/langer@v0.1.1
+go install github.com/fingerskier/langer/cmd/langer@v0.7.0
 ```
 
 Put `$(go env GOPATH)/bin` on your `PATH`, then register MCP yourself:
@@ -105,11 +105,21 @@ langer daemon <root>      # run daemon explicitly
 langer status             # index / daemon status for cwd
 ```
 
-Config defaults follow XDG (`~/.config/lsp-mcp/config.toml`). Language servers
-are declarative registry entries — no built-in commands (SPEC §9: never run
+Config defaults follow XDG (`~/.config/lsp-mcp/config.toml`). User
+`[[language_servers]]` entries are declarative (SPEC §9: never run
 workspace-local binaries without opt-in).
 
-Optional:
+**Managed tools:** when no user entry claims a file extension, langer can
+**ensure** a pinned language server under `~/.langer/tools` (see
+`tools/manifest.json` and `plan/PLAN.md`). First use may need network.
+
+```text
+langer tools list
+langer tools ensure typescript
+langer tools update
+```
+
+Optional config:
 
 ```toml
 idle_timeout = "30m"

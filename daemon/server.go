@@ -18,6 +18,7 @@ import (
 	"github.com/fingerskier/langer/internal/workspace"
 	"github.com/fingerskier/langer/lsp"
 	"github.com/fingerskier/langer/protocol"
+	"github.com/fingerskier/langer/tools"
 )
 
 // Defaults for the daemon's operational bounds.
@@ -81,6 +82,12 @@ type Options struct {
 	// NewSupervisor builds the language server supervisor for a workspace.
 	// Defaults to lsp.NewSupervisor.
 	NewSupervisor func(lsp.Options) (lsp.Supervisor, error)
+
+	// DisableManagedTools skips package tools (lazy ~/.langer/tools installs).
+	// Unit tests that assert UNSUPPORTED for unconfigured extensions set this.
+	DisableManagedTools bool
+	// Tools injects a tools manager when non-nil (and DisableManagedTools is false).
+	Tools *tools.Manager
 
 	// OpenStore is the M3 persistence construction seam. Production uses
 	// index.Open; tests use it to prove that Run, rather than NewServer, owns
@@ -266,6 +273,21 @@ func NewServer(opts Options) (*Server, error) {
 }
 
 func newWorkspaceRegistry(opts Options, store index.Store, onFileActivity func()) *workspace.Registry {
+	var toolsMgr *tools.Manager
+	switch {
+	case opts.DisableManagedTools:
+		// tests / explicit opt-out
+	case opts.Tools != nil:
+		toolsMgr = opts.Tools
+	default:
+		if mgr, err := tools.NewManager(); err != nil {
+			if opts.Logger != nil {
+				opts.Logger.Warn("managed tools unavailable", "err", err)
+			}
+		} else {
+			toolsMgr = mgr
+		}
+	}
 	return workspace.NewRegistry(workspace.RegistryOptions{
 		Config:         opts.Config,
 		Store:          store,
@@ -275,6 +297,7 @@ func newWorkspaceRegistry(opts Options, store index.Store, onFileActivity func()
 		Runner:         opts.Runner,
 		NewSupervisor:  opts.NewSupervisor,
 		OnFileActivity: onFileActivity,
+		Tools:          toolsMgr,
 	})
 }
 

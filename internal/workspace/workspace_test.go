@@ -33,6 +33,8 @@ type fakeSupervisor struct {
 	shutdownHook func()
 }
 
+func (f *fakeSupervisor) Offer(config.LanguageServer) {}
+
 func (f *fakeSupervisor) Acquire(_ context.Context, languageID string) (lsp.Server, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

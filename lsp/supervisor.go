@@ -40,6 +40,12 @@ type Supervisor interface {
 	//	SERVER_CRASHED  a restart is in flight (carries retry_after_ms)
 	Acquire(ctx context.Context, languageID string) (Server, error)
 
+	// Offer registers (or replaces) a language-server entry for later Acquire
+	// without starting it. Used for lazy managed-tools installs: the entry's
+	// command is an absolute path under ~/.langer/tools. User-configured
+	// entries that already share the name are not replaced.
+	Offer(entry config.LanguageServer)
+
 	// Status reports supervision state WITHOUT starting anything: index_status
 	// must never have the side effect of spawning a language server.
 	Status() []protocol.ServerStatus
@@ -271,6 +277,26 @@ func (c *connectionCandidate) deactivate() {
 	c.mu.Unlock()
 }
 
+func (s *supervisor) Offer(entry config.LanguageServer) {
+	if entry.Name == "" || entry.Command == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := strings.ToLower(entry.Name)
+	for i, existing := range s.opts.Servers {
+		if strings.EqualFold(existing.Name, entry.Name) {
+			// Do not clobber a user-configured entry that is already running.
+			if _, live := s.managed[key]; live {
+				return
+			}
+			s.opts.Servers[i] = entry
+			return
+		}
+	}
+	s.opts.Servers = append(s.opts.Servers, entry)
+}
+
 func (s *supervisor) Acquire(ctx context.Context, languageID string) (Server, error) {
 	entry, ok := s.entryFor(languageID)
 	if !ok {
@@ -313,7 +339,11 @@ func (s *supervisor) Acquire(ctx context.Context, languageID string) (Server, er
 // entryFor maps a language id onto a registry entry: by name first, then by the
 // file extensions the entry claims.
 func (s *supervisor) entryFor(languageID string) (config.LanguageServer, bool) {
-	for _, entry := range s.opts.Servers {
+	s.mu.Lock()
+	servers := append([]config.LanguageServer(nil), s.opts.Servers...)
+	s.mu.Unlock()
+
+	for _, entry := range servers {
 		if strings.EqualFold(entry.Name, languageID) {
 			return entry, true
 		}
@@ -322,7 +352,7 @@ func (s *supervisor) entryFor(languageID string) (config.LanguageServer, bool) {
 	if !known {
 		return config.LanguageServer{}, false
 	}
-	for _, entry := range s.opts.Servers {
+	for _, entry := range servers {
 		for _, claimed := range entry.FileExtensions {
 			for _, want := range extensions {
 				if strings.EqualFold(claimed, want) {
@@ -344,6 +374,14 @@ var languageExtensions = map[string][]string{
 	"python":          {".py", ".pyi"},
 	"go":              {".go"},
 	"rust":            {".rs"},
+	"markdown":        {".md", ".mdx"},
+	"html":            {".html", ".htm"},
+	"css":             {".css", ".scss"},
+	"json":            {".json", ".jsonc"},
+	"xml":             {".xml"},
+	"csharp":          {".cs"},
+	"cpp":             {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp"},
+	"c":               {".c", ".h"},
 }
 
 func (s *supervisor) Status() []protocol.ServerStatus {

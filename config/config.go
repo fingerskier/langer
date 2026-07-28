@@ -9,10 +9,11 @@
 // XDG_CONFIG_HOME and XDG_DATA_HOME are honoured when set. Environment
 // overrides exist for the database path, the config path, and the log level.
 //
-// The language server registry is entirely declarative and entirely
-// user-supplied: there are no built-in entries, because SPEC §9 requires that
-// the daemon only ever execute language server binaries the user explicitly
-// configured.
+// The language server registry in config.toml is entirely declarative and
+// user-supplied: Load() never injects built-in [[language_servers]] entries
+// (SPEC §9 / TestNoBuiltinLanguageServers). Managed profiles under
+// ~/.langer/tools are provided separately by package tools and do not appear
+// in Config.LanguageServers until offered at ensure time.
 package config
 
 import (

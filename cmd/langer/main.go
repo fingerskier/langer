@@ -27,6 +27,7 @@ import (
 	"github.com/fingerskier/langer/internal/procx"
 	langermcp "github.com/fingerskier/langer/mcp"
 	"github.com/fingerskier/langer/protocol"
+	"github.com/fingerskier/langer/tools"
 )
 
 // Exit codes. Usage problems are distinguishable from runtime failures so a
@@ -37,8 +38,8 @@ const (
 	exitUsage   = 2
 )
 
-// commands is the complete v0.1 subcommand set (SPEC §10).
-var commands = []string{"mcp", "daemon", "status"}
+// commands is the CLI surface (SPEC §10 plus tools management).
+var commands = []string{"mcp", "daemon", "status", "tools"}
 
 const usageText = `langer — compiler-accurate code intelligence over MCP
 
@@ -46,6 +47,9 @@ Usage:
   langer mcp --stdio        MCP frontend on stdio (auto-starts the workspace daemon)
   langer daemon <root>      run the workspace daemon explicitly (normally auto-started)
   langer status             daemon and index status for the current workspace
+  langer tools list         list managed language-server profiles
+  langer tools ensure <id>  install one profile into ~/.langer/tools
+  langer tools update       ensure every non-disabled profile (may take a while)
 
 Flags:
   -h, --help                show this help
@@ -54,6 +58,7 @@ Environment:
   ` + config.EnvConfigPath + `       path to config.toml (default ~/.config/lsp-mcp/config.toml)
   ` + config.EnvDatabasePath + `           path to the SQLite index (default ~/.local/share/lsp-mcp/index.db)
   ` + config.EnvLogLevel + `         one of debug, info, warn, error (default info)
+  LANGER_TOOLS_DIR               override managed tools root (default ~/.langer/tools)
 `
 
 // errHelp is the sentinel meaning "the user asked for help" — printed to
@@ -79,6 +84,10 @@ type invocation struct {
 	// Root is the absolute workspace root for `daemon <root>`. Workspaces are
 	// identified by absolute path (SPEC §3.2), so it is resolved here.
 	Root string
+	// ToolsVerb is list|ensure|update for the tools subcommand.
+	ToolsVerb string
+	// ToolsProfile is the profile id for tools ensure.
+	ToolsProfile string
 }
 
 func main() {
@@ -108,6 +117,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = runDaemon(inv, stdout, stderr)
 	case "status":
 		err = runStatus(inv, stdout)
+	case "tools":
+		err = runTools(inv, stdout)
 	default:
 		// parse guarantees this is unreachable.
 		err = fmt.Errorf("unhandled command %q", inv.Command)
@@ -135,8 +146,37 @@ func parse(args []string) (*invocation, error) {
 		return parseDaemon(args[1:])
 	case "status":
 		return parseStatus(args[1:])
+	case "tools":
+		return parseTools(args[1:])
 	default:
 		return nil, usagef("unknown subcommand %q; expected one of %s", args[0], strings.Join(commands, ", "))
+	}
+}
+
+func parseTools(args []string) (*invocation, error) {
+	if len(args) == 0 {
+		return nil, usagef("tools: expected list, ensure <id>, or update")
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		return nil, errHelp
+	case "list":
+		if len(args) > 1 {
+			return nil, usagef("tools list: unexpected argument %q", args[1])
+		}
+		return &invocation{Command: "tools", ToolsVerb: "list"}, nil
+	case "update":
+		if len(args) > 1 {
+			return nil, usagef("tools update: unexpected argument %q", args[1])
+		}
+		return &invocation{Command: "tools", ToolsVerb: "update"}, nil
+	case "ensure":
+		if len(args) != 2 {
+			return nil, usagef("tools ensure: profile id required")
+		}
+		return &invocation{Command: "tools", ToolsVerb: "ensure", ToolsProfile: args[1]}, nil
+	default:
+		return nil, usagef("tools: unknown verb %q; expected list, ensure, or update", args[0])
 	}
 }
 
@@ -310,6 +350,60 @@ func logLevel(name string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+func runTools(inv *invocation, stdout io.Writer) error {
+	mgr, err := tools.NewManager()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	switch inv.ToolsVerb {
+	case "list":
+		root, _ := tools.DefaultToolsDir()
+		fmt.Fprintf(stdout, "tools root: %s\n", root)
+		for _, id := range mgr.Manifest.ProfileIDs() {
+			p := mgr.Manifest.Profiles[id]
+			state := "ok"
+			if p.Disabled {
+				state = "disabled"
+				if p.DisabledReason != "" {
+					state += " (" + p.DisabledReason + ")"
+				}
+			}
+			fmt.Fprintf(stdout, "  %-12s %-16s %s\n", id, p.Kind, state)
+		}
+		return nil
+	case "ensure":
+		entry, err := mgr.Ensure(ctx, inv.ToolsProfile)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "%s\t%s\n", entry.Name, entry.Command)
+		return nil
+	case "update":
+		// Never mid-session: CLI path only. Ensures each enabled profile.
+		var failed int
+		for _, id := range mgr.Manifest.ProfileIDs() {
+			p := mgr.Manifest.Profiles[id]
+			if p.Disabled {
+				continue
+			}
+			entry, err := mgr.Ensure(ctx, id)
+			if err != nil {
+				failed++
+				fmt.Fprintf(stdout, "%s\tERROR\t%v\n", id, err)
+				continue
+			}
+			fmt.Fprintf(stdout, "%s\t%s\n", entry.Name, entry.Command)
+		}
+		if failed > 0 {
+			return fmt.Errorf("%d profile(s) failed", failed)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown tools verb %q", inv.ToolsVerb)
 	}
 }
 

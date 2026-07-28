@@ -32,14 +32,14 @@ func isolate(t *testing.T) string {
 	return home
 }
 
-// TestUsageListsExactlyTheSpecSubcommands pins SPEC §10: the v0.1 CLI is
-// constrained to `mcp --stdio`, `daemon <root>`, and `status`. Anything else in
-// the help text is scope creep.
-func TestUsageListsExactlyTheSpecSubcommands(t *testing.T) {
+// TestUsageListsCoreSubcommands pins the documented CLI surface: SPEC §10's
+// mcp/daemon/status plus the managed-tools subcommand from plan/PLAN.md.
+func TestUsageListsCoreSubcommands(t *testing.T) {
 	want := []string{
 		"langer mcp --stdio",
 		"langer daemon <root>",
 		"langer status",
+		"langer tools list",
 	}
 	for _, line := range want {
 		if !strings.Contains(usageText, line) {
@@ -49,11 +49,11 @@ func TestUsageListsExactlyTheSpecSubcommands(t *testing.T) {
 
 	for _, forbidden := range []string{"--http", "langer serve", "langer index", "langer reindex", "langer version"} {
 		if strings.Contains(usageText, forbidden) {
-			t.Errorf("usage mentions out-of-scope %q (SPEC §10 allows three subcommands only):\n%s", forbidden, usageText)
+			t.Errorf("usage mentions out-of-scope %q:\n%s", forbidden, usageText)
 		}
 	}
 
-	if got, want := len(commands), 3; got != want {
+	if got, want := len(commands), 4; got != want {
 		t.Errorf("len(commands) = %d, want %d: %v", got, want, commands)
 	}
 }

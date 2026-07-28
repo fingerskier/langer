@@ -63,14 +63,15 @@ func startDaemon(t *testing.T, tweak func(*Options), setup func(root string, n i
 	fake := newFakeLSP(t, scripted)
 
 	opts := Options{
-		Root:        root,
-		Config:      cfg,
-		Clock:       clock.New(),
-		Logger:      testLogger(t),
-		IdleTimeout: time.Hour, // never sunset unless a test asks for it
-		DrainGrace:  50 * time.Millisecond,
-		Resolver:    fake,
-		Runner:      fake,
+		Root:                root,
+		Config:              cfg,
+		Clock:               clock.New(),
+		Logger:              testLogger(t),
+		IdleTimeout:         time.Hour, // never sunset unless a test asks for it
+		DrainGrace:          50 * time.Millisecond,
+		Resolver:            fake,
+		Runner:              fake,
+		DisableManagedTools: true, // assert config-only UNSUPPORTED without network ensure
 	}
 	if tweak != nil {
 		tweak(&opts)
