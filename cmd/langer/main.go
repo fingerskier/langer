@@ -38,8 +38,8 @@ const (
 	exitUsage   = 2
 )
 
-// commands is the CLI surface (SPEC §10 plus tools management).
-var commands = []string{"mcp", "daemon", "status", "tools"}
+// commands is the CLI surface (SPEC §10 plus tools management + lifecycle).
+var commands = []string{"mcp", "daemon", "status", "tools", "stop"}
 
 const usageText = `langer — compiler-accurate code intelligence over MCP
 
@@ -47,6 +47,11 @@ Usage:
   langer mcp --stdio        MCP frontend on stdio (auto-starts the workspace daemon)
   langer daemon <root>      run the workspace daemon explicitly (normally auto-started)
   langer status             daemon and index status for the current workspace
+  langer stop [root]        stop workspace daemon (cwd if root omitted); next MCP use restarts it
+  langer stop --all         stop every known workspace daemon
+  langer stop --hard        force-kill if graceful drain fails
+  langer stop --all --hard  force-stop every daemon (lock PIDs)
+  langer stop --nuke        nuclear: --all --hard plus kill all langer.exe processes
   langer tools list         list managed language-server profiles
   langer tools ensure <id>  install one profile into ~/.langer/tools
   langer tools update       ensure every non-disabled profile (may take a while)
@@ -88,6 +93,12 @@ type invocation struct {
 	ToolsVerb string
 	// ToolsProfile is the profile id for tools ensure.
 	ToolsProfile string
+	// StopAll stops every known workspace daemon.
+	StopAll bool
+	// StopHard force-kills when drain fails.
+	StopHard bool
+	// StopNuke kills all langer process images after --all --hard.
+	StopNuke bool
 }
 
 func main() {
@@ -119,6 +130,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = runStatus(inv, stdout)
 	case "tools":
 		err = runTools(inv, stdout)
+	case "stop":
+		err = runStop(inv, stdout, stderr)
 	default:
 		// parse guarantees this is unreachable.
 		err = fmt.Errorf("unhandled command %q", inv.Command)
@@ -148,9 +161,57 @@ func parse(args []string) (*invocation, error) {
 		return parseStatus(args[1:])
 	case "tools":
 		return parseTools(args[1:])
+	case "stop":
+		return parseStop(args[1:])
 	default:
 		return nil, usagef("unknown subcommand %q; expected one of %s", args[0], strings.Join(commands, ", "))
 	}
+}
+
+func parseStop(args []string) (*invocation, error) {
+	inv := &invocation{Command: "stop"}
+	var rootArg string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "-h", "--help", "help":
+			return nil, errHelp
+		case "--all":
+			inv.StopAll = true
+		case "--hard":
+			inv.StopHard = true
+		case "--nuke":
+			inv.StopNuke = true
+			inv.StopAll = true
+			inv.StopHard = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return nil, usagef("stop: unknown flag %q", a)
+			}
+			if rootArg != "" {
+				return nil, usagef("stop: unexpected extra argument %q", a)
+			}
+			rootArg = a
+		}
+	}
+	if inv.StopAll && rootArg != "" {
+		return nil, usagef("stop: --all does not take a root path")
+	}
+	if rootArg != "" {
+		root, err := filepath.Abs(rootArg)
+		if err != nil {
+			return nil, usagef("stop: resolving %q: %v", rootArg, err)
+		}
+		info, err := os.Stat(root)
+		if err != nil {
+			return nil, usagef("stop: workspace root %s: %v", root, err)
+		}
+		if !info.IsDir() {
+			return nil, usagef("stop: workspace root %s is not a directory", root)
+		}
+		inv.Root = root
+	}
+	return inv, nil
 }
 
 func parseTools(args []string) (*invocation, error) {
@@ -351,6 +412,53 @@ func logLevel(name string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+func runStop(inv *invocation, stdout, stderr io.Writer) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	opts := daemonctl.StopOptions{Hard: inv.StopHard, Session: "cli-stop"}
+
+	if inv.StopNuke {
+		fmt.Fprintln(stderr, "warning: nuke force-kills langer processes; active MCP sessions will drop")
+	}
+
+	if inv.StopAll || inv.StopNuke {
+		results, err := daemonctl.StopAll(ctx, cfg, opts)
+		for _, r := range results {
+			label := r.Root
+			if label == "" {
+				label = r.Socket
+			}
+			fmt.Fprintf(stdout, "%s\t%s\t%s\n", label, r.Action, r.Message)
+		}
+		if inv.StopNuke {
+			n, nErr := daemonctl.NukeForce()
+			fmt.Fprintf(stdout, "nuke\tkilled\t%d langer process(es)\n", n)
+			if nErr != nil && err == nil {
+				err = nErr
+			}
+		}
+		if len(results) == 0 && !inv.StopNuke {
+			fmt.Fprintln(stdout, "already_stopped\tnone\tno daemon sockets or locks")
+		}
+		return err
+	}
+
+	root := inv.Root
+	if root == "" {
+		var gerr error
+		root, gerr = os.Getwd()
+		if gerr != nil {
+			return gerr
+		}
+	}
+	res, err := daemonctl.Stop(ctx, cfg, root, opts)
+	fmt.Fprintf(stdout, "%s\t%s\t%s\n", res.Root, res.Action, res.Message)
+	return err
 }
 
 func runTools(inv *invocation, stdout io.Writer) error {

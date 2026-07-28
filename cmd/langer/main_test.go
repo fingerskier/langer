@@ -40,6 +40,7 @@ func TestUsageListsCoreSubcommands(t *testing.T) {
 		"langer daemon <root>",
 		"langer status",
 		"langer tools list",
+		"langer stop",
 	}
 	for _, line := range want {
 		if !strings.Contains(usageText, line) {
@@ -53,8 +54,53 @@ func TestUsageListsCoreSubcommands(t *testing.T) {
 		}
 	}
 
-	if got, want := len(commands), 4; got != want {
+	if got, want := len(commands), 5; got != want {
 		t.Errorf("len(commands) = %d, want %d: %v", got, want, commands)
+	}
+}
+
+func TestParseStop(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name    string
+		args    []string
+		wantAll bool
+		wantHard bool
+		wantNuke bool
+		wantRoot bool
+		wantErr bool
+	}{
+		{name: "cwd", args: []string{"stop"}},
+		{name: "root", args: []string{"stop", root}, wantRoot: true},
+		{name: "all", args: []string{"stop", "--all"}, wantAll: true},
+		{name: "hard", args: []string{"stop", "--hard"}, wantHard: true},
+		{name: "all hard", args: []string{"stop", "--all", "--hard"}, wantAll: true, wantHard: true},
+		{name: "nuke", args: []string{"stop", "--nuke"}, wantAll: true, wantHard: true, wantNuke: true},
+		{name: "all with root", args: []string{"stop", "--all", root}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inv, err := parse(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inv.Command != "stop" {
+				t.Fatalf("command = %q", inv.Command)
+			}
+			if inv.StopAll != tt.wantAll || inv.StopHard != tt.wantHard || inv.StopNuke != tt.wantNuke {
+				t.Fatalf("flags all=%v hard=%v nuke=%v want all=%v hard=%v nuke=%v",
+					inv.StopAll, inv.StopHard, inv.StopNuke, tt.wantAll, tt.wantHard, tt.wantNuke)
+			}
+			if tt.wantRoot && inv.Root != root {
+				t.Fatalf("root = %q", inv.Root)
+			}
+		})
 	}
 }
 

@@ -185,12 +185,16 @@ func dialAndHandshake(ctx context.Context, socket, root string, session protocol
 		return nil, &mismatchError{daemonVersion: result.ProtocolVersion}
 	}
 
-	if result.Root != "" && result.Root != root {
+	if root != "" && result.Root != "" && result.Root != root {
 		// A hash collision or a hand-edited socket path. Refusing beats
 		// answering with another project's compilation context.
 		_ = client.Close()
 		return nil, protocol.NewErrorf(protocol.ErrInternal,
 			"the daemon on %s serves %s, not %s", socket, result.Root, root)
+	}
+	// Prefer the daemon's reported root (needed when dialing by socket alone).
+	if result.Root != "" {
+		client.root = result.Root
 	}
 	return client, nil
 }
