@@ -1,5 +1,15 @@
-import { createWriteStream } from "node:fs";
-import { access, chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { createWriteStream, constants as fsConstants } from "node:fs";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import path from "node:path";
@@ -18,12 +28,14 @@ import {
  *
  * Download order: explicit --version/package version tag, then (unless the
  * user pinned --version) the latest GitHub release that publishes this asset.
- * That softens brief npm-vs-tag skew (e.g. npm still at 0.1.0 while GH is v0.1.1).
+ * That softens brief npm-vs-tag skew (e.g. npm 0.7.3 while GH assets are v0.7.0).
  *
  * A sibling `langer[.exe].version` stamp records the npm package version that
  * last installed the binary. If the stamp is missing or differs from the
- * current package version, the binary is re-downloaded (stale pre-tools
- * binaries are a common case after a major bump).
+ * current package version, the binary is re-downloaded.
+ *
+ * On Windows, replacing a running langer.exe uses rename-aside (running EXEs
+ * can usually be renamed; they cannot always be overwritten in place).
  */
 export async function ensureBinary(options = {}) {
   const home = options.home;
@@ -43,8 +55,6 @@ export async function ensureBinary(options = {}) {
     try {
       await access(dest);
       const stamp = await readStamp(stampPath);
-      // Reuse only when this package version already installed the binary.
-      // Missing stamp ⇒ treat as legacy install (force refresh).
       if (stamp === version) {
         return dest;
       }
@@ -61,6 +71,7 @@ export async function ensureBinary(options = {}) {
   if (options.url) {
     candidates.push({ label: options.url, url: options.url });
   } else {
+    // Prefer matching tag, then latest (common when npm is ahead of GH assets).
     candidates.push({ label: tag, url: releaseDownloadUrl(tag, asset, repo) });
     if (!versionPinned) {
       candidates.push({
@@ -76,12 +87,10 @@ export async function ensureBinary(options = {}) {
   for (const candidate of candidates) {
     try {
       await downloadFile(candidate.url, tmp);
-      await rename(tmp, dest);
+      await installBinaryFile(tmp, dest);
       if (process.platform !== "win32") {
         await chmod(dest, 0o755);
       }
-      // Stamp with the *npm package* version so a 0.7.1 package that falls
-      // back to latest (v0.7.0 assets) does not re-download forever.
       await writeFile(stampPath, `${version}\n`, "utf8");
       return dest;
     } catch (err) {
@@ -97,9 +106,70 @@ export async function ensureBinary(options = {}) {
 
   throw new Error(
     `failed to download langer (${asset}):\n  - ${errors.join("\n  - ")}\n` +
+      `If you see EPERM/EACCES on Windows, stop agents using langer MCP (or kill langer.exe), then retry.\n` +
       `Build from source: go install github.com/fingerskier/langer/cmd/langer@${tag}\n` +
       `Or pin a release with assets: npx @fingerskier/langer ensure --version 0.7.0 --force`,
   );
+}
+
+/**
+ * Move a downloaded file into place. Windows: rename existing exe aside first
+ * so a running MCP binary does not block the update (EPERM on rename/overwrite).
+ */
+export async function installBinaryFile(tmpPath, destPath) {
+  try {
+    await access(destPath);
+  } catch {
+    await rename(tmpPath, destPath);
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const aside = `${destPath}.old`;
+    try {
+      await unlink(aside);
+    } catch {
+      // ignore missing
+    }
+    try {
+      // Running EXEs can usually be renamed on Windows.
+      await rename(destPath, aside);
+    } catch {
+      // Fall through to copy/overwrite attempts.
+    }
+    try {
+      await rename(tmpPath, destPath);
+      try {
+        await unlink(aside);
+      } catch {
+        // still running from aside path — leave for next install
+      }
+      return;
+    } catch (err) {
+      // try copy into place
+      try {
+        await copyFile(tmpPath, destPath);
+        await unlink(tmpPath);
+        try {
+          await unlink(aside);
+        } catch {
+          // ignore
+        }
+        return;
+      } catch {
+        throw err;
+      }
+    }
+  }
+
+  // Unix: replace atomically when possible.
+  try {
+    await rename(tmpPath, destPath);
+    return;
+  } catch {
+    await copyFile(tmpPath, destPath);
+    await unlink(tmpPath);
+  }
 }
 
 async function readStamp(stampPath) {
@@ -119,5 +189,11 @@ async function downloadFile(url, dest) {
   if (!response.ok || !response.body) {
     throw new Error(`HTTP ${response.status} ${response.statusText}`);
   }
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(dest));
+  // Truncate if a previous failed download left a partial file.
+  const handle = await open(dest, fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_WRONLY, 0o600);
+  try {
+    await pipeline(Readable.fromWeb(response.body), handle.createWriteStream());
+  } finally {
+    await handle.close();
+  }
 }
