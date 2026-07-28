@@ -70,12 +70,27 @@ export async function runCli(args) {
  * @param {{ binary?: string, version?: string, force?: boolean, home?: string }} [opts]
  */
 export async function runLangerBinary(args, opts = {}) {
-  const dest = await ensureBinary({
+  let dest = await ensureBinary({
     binary: opts.binary,
     version: opts.version,
     force: opts.force,
     home: opts.home,
   });
+
+  // Stale caches: pre-v0.7 binaries only expose mcp/daemon/status. If the user
+  // asked for `tools` and help omits it, force a re-download once.
+  if (args[0] === "tools" && !opts.binary && !opts.force) {
+    const probe = spawnSync(dest, [], { encoding: "utf8", windowsHide: true });
+    const help = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
+    if (!/\btools\b/.test(help)) {
+      dest = await ensureBinary({
+        version: opts.version,
+        force: true,
+        home: opts.home,
+      });
+    }
+  }
+
   const result = spawnSync(dest, args, {
     stdio: "inherit",
     windowsHide: true,

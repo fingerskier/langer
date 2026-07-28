@@ -1,6 +1,6 @@
 {
   "name": "@fingerskier/langer",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Install and wire the langer LSP-MCP bridge binary into coding agents",
   "keywords": [
     "mcp",
