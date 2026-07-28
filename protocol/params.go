@@ -163,12 +163,26 @@ type ApplyResult struct {
 	Applied []string `json:"applied"`
 }
 
+// IndexSkip is one path the workspace index soft-skipped (failed without
+// failing the whole workspace). Surfaced by index_status so agents can see
+// coverage holes that "ready N/N" would otherwise hide.
+type IndexSkip struct {
+	Path    string `json:"path"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 // IndexStatusResult reports indexing progress and supervision state.
 type IndexStatusResult struct {
 	Root              string         `json:"root_path"`
 	State             IndexState     `json:"state"`
 	FilesIndexed      int            `json:"files_indexed"`
 	FilesTotal        int            `json:"files_total"`
+	// FilesSkipped is the number of soft-skipped paths this daemon session.
+	FilesSkipped      int            `json:"files_skipped,omitempty"`
+	// Skipped lists soft-skipped paths with the structured error that caused
+	// the skip (best-effort; capped for payload size in the workspace layer).
+	Skipped           []IndexSkip    `json:"skipped,omitempty"`
 	LanguageServers   []ServerStatus `json:"language_servers,omitempty"`
 	LastIndexedUnixMS int64          `json:"last_indexed_unix_ms,omitempty"`
 	// Error is present if and only if State is IndexFailed. Background

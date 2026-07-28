@@ -33,6 +33,10 @@ type Store interface {
 	) (committed bool, err error)
 	InvalidateFile(ctx context.Context, ws protocol.WorkspaceID, path string) error
 	DeleteFile(ctx context.Context, ws protocol.WorkspaceID, path string) error
+	// AbandonFile removes a path row without advancing reference_generation or
+	// marking every reference set incomplete. Used when soft-skipping a failed
+	// index attempt that already left (or would leave) a blank-hash orphan.
+	AbandonFile(ctx context.Context, ws protocol.WorkspaceID, path string) error
 	ReconcileWorkspace(ctx context.Context, ws protocol.WorkspaceID, existingPaths []string) (filesPruned int, err error)
 	DocumentSymbols(ctx context.Context, ws protocol.WorkspaceID, path string) ([]protocol.Symbol, error)
 	SearchSymbols(ctx context.Context, ws protocol.WorkspaceID, query string, limit int) ([]protocol.Symbol, error)

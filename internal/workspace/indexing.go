@@ -24,6 +24,11 @@ type indexedSemantics struct {
 	references  map[string][]index.Reference
 }
 
+// maxIndexNotReadyRetries bounds consecutive NOT_READY outcomes for one index
+// job (language server still starting, analysis not settled, etc.). Beyond
+// this the path is soft-skipped so a single stuck file cannot pin the worker.
+const maxIndexNotReadyRetries = 12
+
 func (w *Workspace) startIndex(openCtx context.Context, opts RegistryOptions) error {
 	watcher, err := opts.NewWatcher(w.root, w.scanner, opts.Clock, 0)
 	if err != nil {
@@ -482,7 +487,7 @@ func (w *Workspace) invalidatePathLocked(
 	job := &indexJob{path: rel, generation: w.generations[rel]}
 	w.known[rel] = struct{}{}
 	w.pending[rel] = job.generation
-	delete(w.failed, rel)
+	delete(w.skipped, rel)
 	if !w.indexFatal {
 		w.indexState = protocol.IndexIndexing
 	}
@@ -499,7 +504,7 @@ func (w *Workspace) deletePathLocked(ctx context.Context, rel string) error {
 	w.generations[rel]++
 	delete(w.known, rel)
 	delete(w.pending, rel)
-	delete(w.failed, rel)
+	delete(w.skipped, rel)
 	w.updateIndexStateLocked()
 	w.indexMu.Unlock()
 	return nil
@@ -577,11 +582,22 @@ func (w *Workspace) runIndexWorker() {
 				case <-w.indexCtx.Done():
 					return
 				}
+				notReadyTries := 0
 				for {
 					next, err := w.indexOne(job)
 					if err != nil {
 						structured := protocol.AsError(err)
 						if structured.Code == protocol.ErrNotReady && w.indexCtx.Err() == nil {
+							notReadyTries++
+							if notReadyTries > maxIndexNotReadyRetries {
+								if w.indexCtx.Err() == nil {
+									w.failIndexJob(job, protocol.NewErrorf(protocol.ErrNotReady,
+										"giving up indexing %s after %d NOT_READY retries: %s",
+										job.path, maxIndexNotReadyRetries, structured.Message).
+										WithRetryAfterMS(structured.RetryAfterMS))
+								}
+								break
+							}
 							delay := time.Duration(structured.RetryAfterMS) * time.Millisecond
 							if delay <= 0 {
 								delay = 250 * time.Millisecond
@@ -596,6 +612,7 @@ func (w *Workspace) runIndexWorker() {
 						}
 						break
 					}
+					notReadyTries = 0
 					if next == nil {
 						break
 					}
@@ -809,19 +826,38 @@ func (w *Workspace) readIndexedSemantics(srv lsp.Server, rel, text string) (inde
 				})
 			}
 
-			if srv.Supports(lsp.CapPushDiagnostics) || srv.Supports(lsp.CapPullDiagnostics) {
+			diagsStale := false
+			switch {
+			case srv.Supports(lsp.CapPushDiagnostics):
 				diagnostics, stale, err := srv.Diagnostics(ctx, rel, epoch)
 				if err != nil {
 					return protocol.AsError(err)
 				}
+				// SPEC §4.3: budget expiry is a successful answer with
+				// possibly_stale, not a hard failure. Treating it as NOT_READY
+				// here retried the same file forever (settle budget every
+				// attempt) and left workspaces stuck at 0/N indexed whenever
+				// tsserver did not push diagnostics within the budget — common
+				// on cold JS/TS projects. Commit symbols + whatever diags
+				// settled; do not publish reference sets while analysis is
+				// still moving (partial refs marked complete=1 is worse).
+				diagsStale = stale
 				if stale {
-					return protocol.NewErrorf(protocol.ErrNotReady,
-						"diagnostics for %s did not settle during indexing", rel).WithRetryAfterMS(250)
+					w.log.Debug("indexing with possibly-stale diagnostics; skipping reference collection",
+						"path", rel)
 				}
 				result.diagnostics = diagnostics
+			case srv.Supports(lsp.CapPullDiagnostics):
+				// vscode-css/html/json advertise diagnosticProvider (pull) and
+				// do not publishDiagnostics. Diagnostics() requires push, so
+				// treating CapPull as "must settle diags" soft-skipped every
+				// css/json/html file. Index symbols/refs without diags until
+				// pull diagnostics are implemented.
+				w.log.Debug("skipping diagnostics during indexing; language server uses pull model",
+					"path", rel)
 			}
 
-			if srv.Supports(lsp.CapReferences) {
+			if srv.Supports(lsp.CapReferences) && !diagsStale {
 				for _, symbol := range result.symbols {
 					if keyCounts[symbol.SymbolKey] != 1 || !validSelection[symbol.SymbolKey] {
 						continue
@@ -892,7 +928,7 @@ func (w *Workspace) completeIndexJob(job indexJob) {
 	w.indexMu.Lock()
 	if w.pending[job.path] == job.generation {
 		delete(w.pending, job.path)
-		delete(w.failed, job.path)
+		delete(w.skipped, job.path)
 	}
 	w.updateIndexStateLocked()
 	w.indexMu.Unlock()
@@ -902,7 +938,7 @@ func (w *Workspace) completeDeletedJob(job indexJob) {
 	w.indexMu.Lock()
 	if w.pending[job.path] == job.generation {
 		delete(w.pending, job.path)
-		delete(w.failed, job.path)
+		delete(w.skipped, job.path)
 		delete(w.known, job.path)
 		w.generations[job.path]++
 	}
@@ -927,6 +963,35 @@ func (w *Workspace) failIndex(err error, fatal bool) {
 	w.log.Error("workspace indexing failed", "error", err)
 }
 
+// softSkipPath drops path from the active index set without InvalidateFile
+// (which would poison every reference set). Blank-hash or missing rows are
+// AbandonFile'd so requireWorkspaceCacheReady cannot stick on orphans. A
+// successfully PutFile'd row is left in place (usable per-file cache).
+//
+// Requires the path leaf and cacheMu.Lock.
+func (w *Workspace) softSkipPath(path string, err error) {
+	structured := protocol.AsError(err)
+	if w.store != nil {
+		hash, found, stateErr := w.store.FileState(w.indexCtx, w.id, path)
+		if stateErr != nil {
+			w.log.Debug("soft-skip file state check failed", "path", path, "error", stateErr)
+		} else if !found || hash == "" {
+			if abandonErr := w.store.AbandonFile(w.indexCtx, w.id, path); abandonErr != nil {
+				w.log.Debug("soft-skip abandon failed", "path", path, "error", abandonErr)
+			}
+		}
+	}
+	w.indexMu.Lock()
+	delete(w.pending, path)
+	delete(w.known, path)
+	if w.skipped == nil {
+		w.skipped = map[string]*protocol.Error{}
+	}
+	w.skipped[path] = structured
+	w.updateIndexStateLocked()
+	w.indexMu.Unlock()
+}
+
 func (w *Workspace) failIndexJob(job indexJob, err error) {
 	if err == nil || errors.Is(err, context.Canceled) || w.indexCtx.Err() != nil {
 		return
@@ -937,19 +1002,11 @@ func (w *Workspace) failIndexJob(job indexJob, err error) {
 	}
 	w.cacheMu.Lock()
 	if w.currentIndexJob(job) {
-		// Make a partially written PutFile unobservable as fresh. The original
-		// error remains primary if SQLite is itself failing here.
-		_ = w.store.InvalidateFile(w.indexCtx, w.id, job.path)
-		w.indexMu.Lock()
-		delete(w.pending, job.path)
-		w.failed[job.path] = protocol.AsError(err)
-		w.indexState = protocol.IndexFailed
-		w.indexError = protocol.AsError(err)
-		w.indexMu.Unlock()
+		w.softSkipPath(job.path, err)
 	}
 	w.cacheMu.Unlock()
 	unlock()
-	w.log.Error("workspace file indexing failed", "path", job.path, "error", err)
+	w.log.Error("workspace file indexing failed; skipping path", "path", job.path, "error", err)
 }
 
 func (w *Workspace) failIndexPath(path string, err error) {
@@ -961,29 +1018,15 @@ func (w *Workspace) failIndexPath(path string, err error) {
 		return
 	}
 	w.cacheMu.Lock()
-	_ = w.store.InvalidateFile(w.indexCtx, w.id, path)
-	w.indexMu.Lock()
-	delete(w.pending, path)
-	w.failed[path] = protocol.AsError(err)
-	w.indexState = protocol.IndexFailed
-	w.indexError = protocol.AsError(err)
-	w.indexMu.Unlock()
+	w.softSkipPath(path, err)
 	w.cacheMu.Unlock()
 	unlock()
-	w.log.Error("workspace path indexing failed", "path", path, "error", err)
+	w.log.Error("workspace path indexing failed; skipping path", "path", path, "error", err)
 }
 
 func (w *Workspace) updateIndexStateLocked() {
 	if w.indexFatal {
 		w.indexState = protocol.IndexFailed
-		return
-	}
-	if len(w.failed) > 0 {
-		w.indexState = protocol.IndexFailed
-		for _, err := range w.failed {
-			w.indexError = err
-			break
-		}
 		return
 	}
 	if !w.scanComplete || len(w.pending) > 0 {

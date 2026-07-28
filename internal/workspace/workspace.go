@@ -54,7 +54,9 @@ type Workspace struct {
 	indexMu      sync.Mutex
 	generations  map[string]uint64
 	pending      map[string]uint64
-	failed       map[string]*protocol.Error
+	// skipped records soft-skipped paths for this daemon session (index_status).
+	// It does not force IndexFailed; the workspace can still become ready.
+	skipped      map[string]*protocol.Error
 	known        map[string]struct{}
 	scanComplete bool
 	indexState   protocol.IndexState
@@ -150,7 +152,7 @@ func newWorkspace(ctx context.Context, id protocol.WorkspaceID, root string, opt
 		plans:          map[string]editPlan{},
 		generations:    map[string]uint64{},
 		pending:        map[string]uint64{},
-		failed:         map[string]*protocol.Error{},
+		skipped:        map[string]*protocol.Error{},
 		known:          map[string]struct{}{},
 		indexState: protocol.IndexIdle,
 		overlays:   newOverlays(opts.Clock, opts.OverlayTTL),
@@ -615,6 +617,15 @@ func (w *Workspace) Status(ctx context.Context) (protocol.IndexStatusResult, err
 				localIndexed = 0
 			}
 		}
+		skipped := make([]protocol.IndexSkip, 0, len(w.skipped))
+		for path, skipErr := range w.skipped {
+			entry := protocol.IndexSkip{Path: path}
+			if skipErr != nil {
+				entry.Code = string(skipErr.Code)
+				entry.Message = skipErr.Message
+			}
+			skipped = append(skipped, entry)
+		}
 		w.indexMu.Unlock()
 		w.cacheMu.RUnlock()
 
@@ -623,6 +634,14 @@ func (w *Workspace) Status(ctx context.Context) (protocol.IndexStatusResult, err
 		}
 		if localIndexed < status.FilesIndexed {
 			status.FilesIndexed = localIndexed
+		}
+		sort.Slice(skipped, func(i, j int) bool { return skipped[i].Path < skipped[j].Path })
+		const maxSkippedReport = 32
+		status.FilesSkipped = len(skipped)
+		if len(skipped) > maxSkippedReport {
+			status.Skipped = skipped[:maxSkippedReport]
+		} else {
+			status.Skipped = skipped
 		}
 		degraded := status.FilesIndexed < status.FilesTotal
 		switch {

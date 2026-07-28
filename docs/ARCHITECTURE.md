@@ -704,6 +704,11 @@ type IndexStatusResult struct {
 	State           IndexState     `json:"state"`
 	FilesIndexed    int            `json:"files_indexed"`
 	FilesTotal      int            `json:"files_total"`
+	// FilesSkipped / Skipped report soft-skipped paths (per-file index
+	// failures that did not fail the whole workspace). Ready N/N can still
+	// hide coverage holes; agents should read these fields.
+	FilesSkipped    int            `json:"files_skipped,omitempty"`
+	Skipped         []IndexSkip    `json:"skipped,omitempty"`
 	LanguageServers []ServerStatus `json:"language_servers,omitempty"`
 	LastIndexedUnixMS int64        `json:"last_indexed_unix_ms,omitempty"`
 	// Error is present iff State == IndexFailed. It is always a structured

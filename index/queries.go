@@ -399,6 +399,54 @@ func (s *sqliteStore) DeleteFile(
 	})
 }
 
+// AbandonFile drops a path from the files table without the workspace-wide
+// reference invalidation DeleteFile/InvalidateFile perform. Locations that
+// pointed at the path are removed and only those affected symbol_keys are
+// marked incomplete; reference_generation is unchanged so already-completed
+// sets for other files stay complete.
+func (s *sqliteStore) AbandonFile(
+	ctx context.Context,
+	ws protocol.WorkspaceID,
+	filePath string,
+) error {
+	relative, err := normalizeRelativePath(filePath)
+	if err != nil {
+		return internalError("abandoning file: %v", err)
+	}
+	return s.withWrite(ctx, func(tx *sql.Tx) error {
+		if _, err := workspaceNamespace(ctx, tx, ws); err != nil {
+			return err
+		}
+		now := s.clock.Now().UnixMilli()
+		// Narrow incomplete mark: only sets that list a location on this path.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE reference_sets
+			SET complete = 0, updated_at_unix_ms = ?
+			WHERE workspace_id = ?
+				AND symbol_key IN (
+					SELECT DISTINCT symbol_key
+					FROM "references"
+					WHERE workspace_id = ? AND path = ?
+				)`, now, ws, ws, relative); err != nil {
+			return internalError("marking path-local reference sets incomplete for %s: %v", relative, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM "references"
+			WHERE workspace_id = ? AND path = ?`, ws, relative); err != nil {
+			return internalError("removing reference locations for abandoned %s: %v", relative, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM files WHERE workspace_id = ? AND path = ?`,
+			ws, relative); err != nil {
+			return internalError("abandoning file %s: %v", relative, err)
+		}
+		if err := pruneOrphanReferenceSets(ctx, tx, ws); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func markReferenceSetsIncomplete(
 	ctx context.Context,
 	tx *sql.Tx,

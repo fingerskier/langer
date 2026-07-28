@@ -571,7 +571,19 @@ func runStatus(_ *invocation, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "daemon:     connected\n")
-	fmt.Fprintf(stdout, "index:      %s (%d/%d files)\n", status.State, status.FilesIndexed, status.FilesTotal)
+	if status.FilesSkipped > 0 {
+		fmt.Fprintf(stdout, "index:      %s (%d/%d files, %d skipped)\n",
+			status.State, status.FilesIndexed, status.FilesTotal, status.FilesSkipped)
+		for _, skip := range status.Skipped {
+			if skip.Code != "" {
+				fmt.Fprintf(stdout, "skipped:    %s — %s: %s\n", skip.Path, skip.Code, skip.Message)
+			} else {
+				fmt.Fprintf(stdout, "skipped:    %s — %s\n", skip.Path, skip.Message)
+			}
+		}
+	} else {
+		fmt.Fprintf(stdout, "index:      %s (%d/%d files)\n", status.State, status.FilesIndexed, status.FilesTotal)
+	}
 	for _, server := range status.LanguageServers {
 		fmt.Fprintf(stdout, "language:   %s — %s\n", server.Name, server.State)
 	}

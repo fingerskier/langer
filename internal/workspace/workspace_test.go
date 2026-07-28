@@ -88,6 +88,7 @@ type fakeServer struct {
 	stale              bool
 	edits              []protocol.FileEdit
 	queryErr           error
+	queryErrByPath     map[string]error
 	settles            []string
 
 	withTextSeen        []string
@@ -154,10 +155,19 @@ func (f *fakeServer) WithText(ctx context.Context, path, text string, fn func(co
 	return err
 }
 
+func (f *fakeServer) pathQueryErr(path string) error {
+	if f.queryErr != nil {
+		return f.queryErr
+	}
+	if f.queryErrByPath != nil {
+		return f.queryErrByPath[path]
+	}
+	return nil
+}
+
 func (f *fakeServer) WithDiskText(ctx context.Context, path, _ string, text string, fn func(context.Context, uint64) error) error {
 	f.mu.Lock()
-	if f.queryErr != nil {
-		err := f.queryErr
+	if err := f.pathQueryErr(path); err != nil {
 		f.mu.Unlock()
 		return err
 	}
@@ -232,7 +242,7 @@ func (f *fakeServer) DocumentSymbolsForIndex(_ context.Context, path string) ([]
 		copy(indexSymbols, byPath)
 	}
 	symbols := append([]protocol.Symbol(nil), f.symbols...)
-	err := f.queryErr
+	err := f.pathQueryErr(path)
 	f.mu.Unlock()
 	if started != nil {
 		select {

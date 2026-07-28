@@ -592,6 +592,75 @@ func TestInvalidationNeverExposesPartialReferenceSets(t *testing.T) {
 	}
 }
 
+func TestAbandonFileRemovesBlankHashWithoutPoisoningOtherReferenceSets(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "index.db"), clock.NewFake(storeTestNow))
+	ctx := context.Background()
+	ws := ensureTestWorkspace(t, store, t.TempDir(), "org/repo")
+
+	good := testFileRecord("org/repo", "good.go", "Good")
+	bad := testFileRecord("org/repo", "bad.go", "Bad")
+	for _, record := range []FileRecord{good, bad} {
+		if err := store.PutFile(ctx, ws, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	goodKey := good.Symbols[0].SymbolKey
+	replaceTestReferences(t, store, ws, goodKey, []Reference{
+		{Path: "good.go", Range: good.Symbols[0].SelectionRange, IsDefinition: true},
+	})
+	genBefore, err := store.ReferenceGeneration(ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InvalidateFile(ctx, ws, "bad.go"); err != nil {
+		t.Fatal(err)
+	}
+	// Invalidate poisons all sets; re-complete good after the bad path is orphaned blank.
+	genAfterInvalidate, err := store.ReferenceGeneration(ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if genAfterInvalidate <= genBefore {
+		t.Fatalf("invalidate did not advance generation")
+	}
+	replaceTestReferences(t, store, ws, goodKey, []Reference{
+		{Path: "good.go", Range: good.Symbols[0].SelectionRange, IsDefinition: true},
+	})
+	if _, err := store.ReferencesBySymbolKey(ctx, ws, goodKey); err != nil {
+		t.Fatalf("good refs after re-complete: %v", err)
+	}
+	genBeforeAbandon, err := store.ReferenceGeneration(ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonFile(ctx, ws, "bad.go"); err != nil {
+		t.Fatal(err)
+	}
+	genAfterAbandon, err := store.ReferenceGeneration(ctx, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if genAfterAbandon != genBeforeAbandon {
+		t.Fatalf("AbandonFile advanced reference_generation %d → %d", genBeforeAbandon, genAfterAbandon)
+	}
+	hash, found, err := store.FileState(ctx, ws, "bad.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("abandoned file still present hash=%q", hash)
+	}
+	if _, err := store.ReferencesBySymbolKey(ctx, ws, goodKey); err != nil {
+		t.Fatalf("AbandonFile poisoned good reference set: %v", err)
+	}
+	// Blank-hash orphan gone: workspace cache readiness should not trip on bad.go.
+	if _, err := store.SearchSymbols(ctx, ws, "Good", 10); err != nil {
+		t.Fatalf("SearchSymbols after abandon: %v", err)
+	}
+}
+
 func TestInvalidatingAnySourceFileMakesEveryReferenceSetUnavailable(t *testing.T) {
 	t.Parallel()
 

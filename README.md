@@ -112,10 +112,14 @@ workspace-local binaries without opt-in).
 **Managed tools:** when no user entry claims a file extension, langer can
 **ensure** a pinned language server under `~/.langer/tools` (see
 `tools/manifest.json` and `plan/PLAN.md`). First use may need network.
+Profiles include **typescript**, **python**, **markdown**, **go**, **rust**,
+**html**, **css**, **json**, and others declared in the manifest
+(vscode-langservers-extracted for html/css/json).
 
 ```text
 langer tools list
 langer tools ensure typescript
+langer tools ensure html    # also installs shared css/json bins
 langer tools update
 
 # same via npx (downloads binary if needed, then runs it):

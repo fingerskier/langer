@@ -36,7 +36,7 @@ func (s *Server) registerSessionTools() {
 			return toolOutput(out, err)
 		})
 
-	sdk.AddTool(s.sdk, &sdk.Tool{Name: "index_status", Description: "Report index progress and language-server state." + retryGuidance},
+	sdk.AddTool(s.sdk, &sdk.Tool{Name: "index_status", Description: "Report index progress, language-server state, and soft-skipped paths (files_skipped / skipped). ready N/N can still omit coverage; inspect skipped before assuming full-workspace symbols/references." + retryGuidance},
 		func(ctx context.Context, req *sdk.CallToolRequest, _ emptyInput) (*sdk.CallToolResult, map[string]any, error) {
 			session, ws, err := s.workspace(ctx, req)
 			if err != nil {

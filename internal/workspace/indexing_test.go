@@ -242,6 +242,15 @@ func (s *fakeIndexStore) DeleteFile(_ context.Context, _ protocol.WorkspaceID, p
 	return nil
 }
 
+func (s *fakeIndexStore) AbandonFile(_ context.Context, _ protocol.WorkspaceID, path string) error {
+	s.order.add("abandon:" + path)
+	s.mu.Lock()
+	// No referenceGen bump — that is the whole point vs Invalidate/Delete.
+	delete(s.files, path)
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *fakeIndexStore) ReconcileWorkspace(_ context.Context, _ protocol.WorkspaceID, existing []string) (int, error) {
 	keep := make(map[string]struct{}, len(existing))
 	for _, path := range existing {
@@ -536,6 +545,218 @@ func TestIndexedOpenIsWatcherFirstAndPersistsDiskOnlySymbols(t *testing.T) {
 	}
 	if _, open := h.srv.openText("src/user.ts"); open {
 		t.Error("background indexing left a previously closed document open")
+	}
+}
+
+// A later per-file index failure must not re-InvalidateFile the whole
+// workspace: that advanced reference_generation and wiped complete=1 sets
+// from earlier successful files, leaving get_references stuck on NOT_READY.
+func TestPerFileIndexFailureDoesNotPoisonPriorReferenceSets(t *testing.T) {
+	h := newIndexedHarness(t, func(h *indexedHarness) {
+		write(t, h.root, "src/good.ts", "export const good = 1\n")
+		write(t, h.root, "src/bad.ts", "export const bad = 1\n")
+		h.scanner.files = []string{"src/good.ts", "src/bad.ts"}
+		h.srv.queryErrByPath = map[string]error{
+			"src/bad.ts": protocol.NewError(protocol.ErrUnsupported, "css language server cannot documentSymbol"),
+		}
+		h.srv.indexSymbolsByPath = map[string][]lsp.IndexSymbol{
+			"src/good.ts": {{
+				Symbol: protocol.Symbol{
+					Name: "good", Kind: protocol.SymbolKindConstant, Path: "src/good.ts",
+					Range: rng(0, 0, 0, 22),
+				},
+				SelectionRange:    rng(0, 13, 0, 17),
+				HasSelectionRange: true,
+			}},
+		}
+		h.srv.locationsByPath = map[string][]protocol.Location{
+			"src/good.ts": {{Path: "src/good.ts", Range: rng(0, 13, 0, 17), IsDefinition: true}},
+		}
+	})
+
+	file := waitForPut(t, h.store.puts)
+	if file.Path != "src/good.ts" {
+		t.Fatalf("put %q, want only the successful file", file.Path)
+	}
+	waitForReady(t, h.ws)
+
+	// A second put for bad.ts would mean the soft-skip did not fire.
+	select {
+	case extra := <-h.store.puts:
+		t.Fatalf("failed path was still committed: %s", extra.Path)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	h.store.mu.Lock()
+	genAfter := h.store.referenceGen
+	refs := len(h.store.refs)
+	_, hasGood := h.store.files["src/good.ts"]
+	_, hasBad := h.store.files["src/bad.ts"]
+	h.store.mu.Unlock()
+	if !hasGood {
+		t.Fatal("successful file missing from store")
+	}
+	if hasBad {
+		t.Fatal("failed path was committed to the store")
+	}
+	if refs == 0 {
+		t.Fatal("per-file failure cleared prior reference sets")
+	}
+	// Staging invalidates twice (two paths) then no further invalidate on soft-skip.
+	// referenceGen should remain at the post-staging value, not climb further.
+	if genAfter < 2 {
+		t.Fatalf("referenceGen = %d, want at least staging invalidations", genAfter)
+	}
+	// Soft-skip must not issue another InvalidateFile for bad.ts after the
+	// successful good.ts put (order: invalidate* then put:good, no later invalidate:bad).
+	order := h.order.snapshot()
+	putAt := operationIndex(order, "put:src/good.ts")
+	if putAt < 0 {
+		t.Fatalf("order missing put: %v", order)
+	}
+	for i, item := range order[putAt+1:] {
+		if item == "invalidate:src/bad.ts" || item == "invalidate:src/good.ts" {
+			t.Fatalf("post-put invalidation %q at offset %d poisons reference sets: %v", item, putAt+1+i, order)
+		}
+	}
+
+	status, err := h.ws.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != protocol.IndexReady {
+		t.Fatalf("status = %+v, want ready after soft-skipping a failed path", status)
+	}
+}
+
+// Cold tsserver projects often exceed the SPEC §4.3 settle budget before the
+// first publishDiagnostics. Indexing must still commit symbols/diagnostics;
+// infinite NOT_READY on possibly_stale left real workspaces stuck at 0/N.
+// Reference collection is skipped while diags are stale so partial LS results
+// are not published as complete=1.
+func TestIndexingCommitsWhenDiagnosticsArePossiblyStale(t *testing.T) {
+	wantDiags := []protocol.Diagnostic{{
+		Path: "src/user.ts", Message: "unused", Severity: protocol.SeverityHint,
+		Range: rng(1, 2, 1, 4),
+	}}
+	h := newIndexedHarness(t, func(h *indexedHarness) {
+		h.srv.stale = true
+		h.srv.diags = wantDiags
+		h.srv.indexSymbols = []lsp.IndexSymbol{{
+			Symbol: protocol.Symbol{
+				Name: "User", Kind: protocol.SymbolKindInterface, Path: "src/user.ts",
+				Range: rng(0, 0, 2, 1),
+			},
+			SelectionRange:    rng(0, 17, 0, 21),
+			HasSelectionRange: true,
+		}}
+		h.srv.locationsByPath = map[string][]protocol.Location{
+			"src/user.ts": {{Path: "src/user.ts", Range: rng(0, 17, 0, 21), IsDefinition: true}},
+		}
+	})
+
+	file := waitForPut(t, h.store.puts)
+	if file.Path != "src/user.ts" {
+		t.Fatalf("indexed path = %q", file.Path)
+	}
+	if len(file.Symbols) != 1 || file.Symbols[0].Symbol.Name != "User" {
+		t.Fatalf("indexed symbols = %+v", file.Symbols)
+	}
+	if len(file.Diagnostics) != 1 || file.Diagnostics[0].Message != "unused" {
+		t.Fatalf("indexed diagnostics = %+v, want committed possibly-stale set", file.Diagnostics)
+	}
+	h.store.mu.Lock()
+	if len(h.store.refs) != 0 {
+		t.Fatalf("stale diagnostics published reference sets: %+v", h.store.refs)
+	}
+	h.store.mu.Unlock()
+	h.srv.mu.Lock()
+	if h.srv.referenceCalls != 0 {
+		t.Fatalf("stale diagnostics still issued %d reference queries", h.srv.referenceCalls)
+	}
+	h.srv.mu.Unlock()
+	waitForReady(t, h.ws)
+}
+
+// Pull-model servers (vscode-css/html/json) advertise diagnosticProvider and
+// not publishDiagnostics. Indexing must not call push Diagnostics for them.
+func TestIndexingSkipsPushDiagnosticsWhenCapPushUnsupported(t *testing.T) {
+	h := newIndexedHarness(t, func(h *indexedHarness) {
+		h.srv.unsupported[lsp.CapPushDiagnostics] = true
+		h.srv.indexSymbols = []lsp.IndexSymbol{{
+			Symbol: protocol.Symbol{
+				Name: "User", Kind: protocol.SymbolKindInterface, Path: "src/user.ts",
+				Range: rng(0, 0, 2, 1),
+			},
+			SelectionRange:    rng(0, 17, 0, 21),
+			HasSelectionRange: true,
+		}}
+		h.srv.locationsByPath = map[string][]protocol.Location{
+			"src/user.ts": {{Path: "src/user.ts", Range: rng(0, 17, 0, 21), IsDefinition: true}},
+		}
+	})
+	file := waitForPut(t, h.store.puts)
+	if file.Path != "src/user.ts" {
+		t.Fatalf("path = %q", file.Path)
+	}
+	if len(file.Diagnostics) != 0 {
+		t.Fatalf("pull-only path stored push diagnostics: %+v", file.Diagnostics)
+	}
+	if h.srv.settleCount("src/user.ts") != 0 {
+		t.Fatal("push Diagnostics was called for a CapPush-unsupported server")
+	}
+	h.store.mu.Lock()
+	if len(h.store.refs) == 0 {
+		t.Fatal("expected reference indexing when diags are not required")
+	}
+	h.store.mu.Unlock()
+	waitForReady(t, h.ws)
+}
+
+// Soft-skip after InvalidateFile must AbandonFile blank-hash rows so the
+// store cannot report EXISTS(content_hash='') forever.
+func TestSoftSkipAbandonsBlankHashOrphans(t *testing.T) {
+	h := newIndexedHarness(t, func(h *indexedHarness) {
+		write(t, h.root, "src/good.ts", "export const good = 1\n")
+		write(t, h.root, "src/bad.ts", "export const bad = 1\n")
+		h.scanner.files = []string{"src/good.ts", "src/bad.ts"}
+		h.srv.queryErrByPath = map[string]error{
+			"src/bad.ts": protocol.NewError(protocol.ErrUnsupported, "cannot index"),
+		}
+		h.srv.indexSymbolsByPath = map[string][]lsp.IndexSymbol{
+			"src/good.ts": {{
+				Symbol: protocol.Symbol{
+					Name: "good", Kind: protocol.SymbolKindConstant, Path: "src/good.ts",
+					Range: rng(0, 0, 0, 22),
+				},
+				SelectionRange:    rng(0, 13, 0, 17),
+				HasSelectionRange: true,
+			}},
+		}
+	})
+	_ = waitForPut(t, h.store.puts)
+	waitForReady(t, h.ws)
+
+	order := h.order.snapshot()
+	if operationIndex(order, "abandon:src/bad.ts") < 0 {
+		t.Fatalf("soft-skip did not abandon blank-hash path: %v", order)
+	}
+	h.store.mu.Lock()
+	_, hasBad := h.store.files["src/bad.ts"]
+	h.store.mu.Unlock()
+	if hasBad {
+		t.Fatal("blank-hash orphan for soft-skipped path still in store")
+	}
+
+	status, err := h.ws.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.FilesSkipped != 1 || len(status.Skipped) != 1 || status.Skipped[0].Path != "src/bad.ts" {
+		t.Fatalf("status skips = %+v, want src/bad.ts once", status)
+	}
+	if status.State != protocol.IndexReady {
+		t.Fatalf("status = %+v, want ready", status)
 	}
 }
 
