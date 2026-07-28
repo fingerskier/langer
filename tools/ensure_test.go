@@ -150,3 +150,37 @@ func TestDisabledProfile(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestEmbeddedCppCsharpXmlEnabled(t *testing.T) {
+	m, err := LoadManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"cpp", "csharp", "xml"} {
+		p, ok := m.Profile(id)
+		if !ok {
+			t.Fatalf("missing profile %s", id)
+		}
+		if p.Disabled {
+			t.Fatalf("profile %s still disabled: %s", id, p.DisabledReason)
+		}
+	}
+	if _, _, ok := m.ProfileForExtension(".cpp"); !ok {
+		t.Fatal("expected .cpp covered")
+	}
+	if _, _, ok := m.ProfileForExtension(".cs"); !ok {
+		t.Fatal("expected .cs covered")
+	}
+	if _, _, ok := m.ProfileForExtension(".xml"); !ok {
+		t.Fatal("expected .xml covered")
+	}
+	if p, _ := m.Profile("cpp"); p.Kind != "github_release" || p.Bin != "clangd" {
+		t.Fatalf("cpp primary = %+v", p)
+	}
+	if p, _ := m.Profile("csharp"); p.Kind != "dotnet_tool" || p.Package != "csharp-ls" {
+		t.Fatalf("csharp primary = %+v", p)
+	}
+	if p, _ := m.Profile("xml"); p.Kind != "github_release" || p.Bin != "lemminx" {
+		t.Fatalf("xml primary = %+v", p)
+	}
+}

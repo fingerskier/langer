@@ -110,13 +110,14 @@ Primaries and alternates: **`plan/LANGUAGE_SERVERS.md`**.
 
 ### Phase C — Systems
 
-- [x] Manifest: `go` (`go install`), `rust` (github; **archive extract still TODO**)  
-- [ ] `cpp` / clangd — disabled until pins
+- [x] Manifest: `go` (`go install`), `rust` (github; archive extract supported)  
+- [x] `cpp` / **clangd 22.1.6** (zip + extract; sha256 pinned)
 
 ### Phase D — Web / data / other
 
 - [x] Manifest: `html`, `css`, `json` (shared npm install)  
-- [ ] `xml`, `csharp`, `gdscript`, `csv`/`tsv` — disabled until pin-able
+- [x] `xml` / **lemminx 0.29.3** native zips; `csharp` / **csharp-ls 0.26.0** via `dotnet tool`  
+- [ ] `gdscript`, `csv`/`tsv` — still disabled
 
 ### Phase E — CLI & updates
 

@@ -19,10 +19,10 @@ Checksums and pinned versions live in the **release tools manifest**, not here.
 | `rust` | `.rs` | **rust-analyzer** | GitHub release binary | Root markers: `Cargo.toml` |
 | `html` | `.html`, `.htm` | **vscode-html-language-server** | npm (`vscode-langservers-extracted`) | HTMX: same server; project tags/attrs are editor/data, not a separate LS |
 | `css` | `.css`, `.scss` | **vscode-css-language-server** | same package as HTML stack | SCSS via CSS LS where supported |
-| `xml` | `.xml` | **lemminx** | GitHub / Red Hat binary or package | Schema-aware XML |
+| `xml` | `.xml`, `.xsd`, `.xsl`, … | **lemminx** (Eclipse / Red Hat binary) | GitHub `redhat-developer/vscode-xml` native zip **0.29.3** | Schema-aware; no Java required for native builds |
 | `json` | `.json`, `.jsonc` | **vscode-json-language-server** | `vscode-langservers-extracted` | JSONC included |
-| `csharp` | `.cs` | **csharp-ls** | dotnet tool / release into tools prefix | Lighter than full OmniSharp for agent use |
-| `cpp` | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, … | **clangd** | GitHub / LLVM release binary | **One profile** for C and C++ (same LS); `compile_commands.json` discovery |
+| `csharp` | `.cs`, `.csx` | **csharp-ls** (razzmatazz) | `dotnet tool install` **0.26.0** into tools prefix | Needs **.NET SDK** on PATH; lighter than OmniSharp |
+| `cpp` | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, … | **clangd** | GitHub `clangd/clangd` **22.1.6** zip | C+C++ one profile; wants `compile_commands.json` |
 | `gdscript` | `.gd`, `.tscn`? | **Godot language server** (Godot 4 LSP) | Documented Godot/editor headless or community binary — **packaging TBD** | Include if ensure path is reliable; else ship profile when fetch is solid |
 | `csv` | `.csv` | **Best-effort / deferred primary** | See alternates | No strong mainstream LS; enable when a pin-able server exists |
 | `tsv` | `.tsv` | **Same as csv** (shared implementation) | — | Prefer one `csv` profile serving both extensions if one LS covers both |
@@ -50,10 +50,10 @@ Checksums and pinned versions live in the **release tools manifest**, not here.
 | `rust` | (none strong) | — |
 | `html` | Tailwind LS (complement), emmet-ls (complement) | Complements, not full HTML replacements |
 | `css` | tailwindcss-language-server | Utility-class projects |
-| `xml` | (editor-embedded XML servers) | If lemminx packaging is painful |
+| `xml` | lemminx uber-JAR + system Java | If native binary missing for a platform |
 | `json` | (same langservers-extracted only, practically) | — |
 | `csharp` | OmniSharp, Roslyn Language Server (`Microsoft.CodeAnalysis.LanguageServer`) | Heavier, fuller IDE fidelity |
-| `cpp` | ccls | Alternate C/C++ indexer |
+| `cpp` | ccls; LLVM package-manager clangd | Alternate indexer / distro packages |
 | `gdscript` | godot-gdscript-toolkit / community LSP forks | If official Godot LSP packaging fails |
 | `csv` / `tsv` | Custom thin LS, redhat.vscode-xml-style data tools, “no LS” (syntax only via other means) | Only if a maintained stdio LSP + checksummable asset appears |
 

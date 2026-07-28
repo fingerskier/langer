@@ -145,33 +145,105 @@
     "xml": {
       "kind": "github_release",
       "repo": "redhat-developer/vscode-xml",
-      "tag": "0.27.1",
-      "args": ["-Djava.import.generatesMetadataFilesAtProjectRoot=false"],
-      "file_extensions": [".xml"],
-      "root_markers": [".git"],
-      "disabled": true,
-      "disabled_reason": "lemminx packaging TBD"
+      "tag": "0.29.3",
+      "bin": "lemminx",
+      "args": [],
+      "file_extensions": [".xml", ".xsd", ".xsl", ".xslt", ".dtd"],
+      "root_markers": [".git", "pom.xml", "build.gradle", "catalog.xml"],
+      "assets": {
+        "windows/amd64": {
+          "name": "lemminx-win32.zip",
+          "urls": [
+            "https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-win32.zip"
+          ],
+          "sha256": "7eaefaac68253b0ec8e0ad1f1c0f2d0755423d4e99e52497428b52f80df28eb7",
+          "extract_bin": "lemminx-win32.exe"
+        },
+        "linux/amd64": {
+          "name": "lemminx-linux-x86_64.zip",
+          "urls": [
+            "https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-linux-x86_64.zip"
+          ],
+          "sha256": "1acc44e24201c1d2f5ccb4e43e7426ed0df6909207a81ff199810e2808104d89",
+          "extract_bin": "lemminx-linux"
+        },
+        "linux/arm64": {
+          "name": "lemminx-linux-aarch_64.zip",
+          "urls": [
+            "https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-linux-aarch_64.zip"
+          ],
+          "sha256": "0b88a49e83c2611282672f5123ce33abf1371c8e3c55cad6ee45ea00626ffa1b",
+          "extract_bin": "lemminx-linux"
+        },
+        "darwin/amd64": {
+          "name": "lemminx-osx-x86_64.zip",
+          "urls": [
+            "https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-osx-x86_64.zip"
+          ],
+          "sha256": "9e56123194b5c1fdc7d87f1bd21c83cc996ba7be913def3a2836a13305bcd273",
+          "extract_bin": "lemminx-osx-x86_64"
+        },
+        "darwin/arm64": {
+          "name": "lemminx-osx-aarch_64.zip",
+          "urls": [
+            "https://github.com/redhat-developer/vscode-xml/releases/download/0.29.3/lemminx-osx-aarch_64.zip"
+          ],
+          "sha256": "185db5630ce85be43ea0fab034e7841b1327c2793db05ab481e029cf493d86ce",
+          "extract_bin": "lemminx-osx-aarch_64"
+        }
+      }
     },
     "csharp": {
       "kind": "dotnet_tool",
       "package": "csharp-ls",
-      "version": "0.16.0",
+      "version": "0.26.0",
       "bin": "csharp-ls",
       "args": [],
-      "file_extensions": [".cs"],
-      "root_markers": [".sln", ".csproj"],
-      "disabled": true,
-      "disabled_reason": "dotnet tool packaging TBD"
+      "file_extensions": [".cs", ".csx"],
+      "root_markers": [".sln", ".csproj", "global.json", "Directory.Build.props"]
     },
     "cpp": {
       "kind": "github_release",
       "repo": "clangd/clangd",
-      "tag": "18.1.3",
+      "tag": "22.1.6",
+      "bin": "clangd",
       "args": [],
-      "file_extensions": [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"],
-      "root_markers": ["compile_commands.json", "CMakeLists.txt", ".clangd"],
-      "disabled": true,
-      "disabled_reason": "clangd asset pins TBD"
+      "file_extensions": [".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh", ".ipp", ".ixx"],
+      "root_markers": ["compile_commands.json", "compile_flags.txt", "CMakeLists.txt", ".clangd", "meson.build"],
+      "assets": {
+        "windows/amd64": {
+          "name": "clangd-windows-22.1.6.zip",
+          "urls": [
+            "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-windows-22.1.6.zip"
+          ],
+          "sha256": "ce54f16e0b4fd76d450eeda9664420b195360b73febcfe40e661108fa57f2ce1",
+          "extract_bin": "clangd.exe"
+        },
+        "linux/amd64": {
+          "name": "clangd-linux-22.1.6.zip",
+          "urls": [
+            "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-linux-22.1.6.zip"
+          ],
+          "sha256": "a9c77443af2e447ed467e84771848d3a6ac1c56f84bcfcde717e66318de77cfa",
+          "extract_bin": "clangd"
+        },
+        "darwin/amd64": {
+          "name": "clangd-mac-22.1.6.zip",
+          "urls": [
+            "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-mac-22.1.6.zip"
+          ],
+          "sha256": "631aef462556cbd74e0ebaae1778a38d1997d0ba3371652ca54f82652a179e7d",
+          "extract_bin": "clangd"
+        },
+        "darwin/arm64": {
+          "name": "clangd-mac-22.1.6.zip",
+          "urls": [
+            "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-mac-22.1.6.zip"
+          ],
+          "sha256": "631aef462556cbd74e0ebaae1778a38d1997d0ba3371652ca54f82652a179e7d",
+          "extract_bin": "clangd"
+        }
+      }
     },
     "gdscript": {
       "kind": "none",

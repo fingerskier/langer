@@ -252,28 +252,61 @@ func findBin(dir, binName string) (string, error) {
 	if binName == "" {
 		return "", fmt.Errorf("no bin name")
 	}
-	candidates := []string{
-		filepath.Join(dir, binName),
-		filepath.Join(dir, "bin", binName),
-		filepath.Join(dir, "node_modules", ".bin", binName),
-	}
+	names := []string{binName}
 	if runtime.GOOS == "windows" {
-		var win []string
-		for _, c := range candidates {
-			win = append(win, c, c+".cmd", c+".exe", c+".ps1")
-		}
-		candidates = win
+		base := strings.TrimSuffix(strings.TrimSuffix(binName, ".exe"), ".cmd")
+		names = []string{binName, base + ".exe", base + ".cmd", base + ".ps1", base}
 	}
-	for _, c := range candidates {
-		if st, err := os.Stat(c); err == nil && !st.IsDir() {
-			abs, err := filepath.Abs(c)
-			if err != nil {
-				return c, nil
+	// Shallow fixed paths first (npm, go install, plain binary).
+	for _, name := range names {
+		for _, c := range []string{
+			filepath.Join(dir, name),
+			filepath.Join(dir, "bin", name),
+			filepath.Join(dir, "node_modules", ".bin", name),
+		} {
+			if st, err := os.Stat(c); err == nil && !st.IsDir() {
+				return absPath(c), nil
 			}
-			return abs, nil
 		}
+	}
+	// Archive layouts (clangd_*/bin/clangd, lemminx-*).
+	var found string
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		base := d.Name()
+		for _, name := range names {
+			if strings.EqualFold(base, name) || strings.EqualFold(base, filepath.Base(name)) {
+				found = path
+				return filepath.SkipAll
+			}
+		}
+		// lemminx-win32.exe matches bin "lemminx"
+		if runtime.GOOS == "windows" {
+			for _, name := range names {
+				stem := strings.TrimSuffix(strings.TrimSuffix(name, ".exe"), ".cmd")
+				if strings.HasPrefix(strings.ToLower(base), strings.ToLower(stem)) &&
+					(strings.HasSuffix(strings.ToLower(base), ".exe") || !strings.Contains(base, ".")) {
+					found = path
+					return filepath.SkipAll
+				}
+			}
+		}
+		return nil
+	})
+	if found != "" {
+		return absPath(found), nil
 	}
 	return "", fmt.Errorf("bin %q not found under %s", binName, dir)
+}
+
+func absPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return abs
 }
 
 // ClaimsExtension is true if user config or an enabled managed profile covers path.
