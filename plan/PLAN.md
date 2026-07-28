@@ -121,7 +121,7 @@ Primaries and alternates: **`plan/LANGUAGE_SERVERS.md`**.
 ### Phase E — CLI & updates
 
 - [x] `langer tools list|ensure|update`  
-- [ ] npm wrapper `npx @fingerskier/langer tools update`  
+- [x] npm proxy: `npx @fingerskier/langer tools …` → ensure binary + exec  
 - [ ] Docs: network once per profile / after pin bump
 
 ### Phase F — UX

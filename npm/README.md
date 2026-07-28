@@ -27,13 +27,22 @@ Restart the agent (or press `r` in Grok `/mcps`).
 | Command | Purpose |
 |---------|---------|
 | `install <claude\|grok\|codex\|all>` | Download binary + write MCP config |
-| `ensure` | Download binary only |
+| `ensure` | Download **langer binary** only (`~/.langer/bin`) |
 | `path` | Print `~/.langer/bin/langer` path |
 | `version` | npm package version |
+| `tools list\|ensure <id>\|update` | Proxy to the binary: managed LS under `~/.langer/tools` |
+| `status` / `mcp` / `daemon` | Proxy other binary subcommands the same way |
 
-Options: `--scope user|repo`, `--binary PATH`, `--version X.Y.Z`, `--force`, `--dry-run`.
+Installer options: `--scope user|repo`, `--binary PATH`, `--version X.Y.Z`, `--force`, `--dry-run`.
 
-The package version selects the GitHub release tag (`0.1.0` → `v0.1.0`) unless
+```powershell
+npx -y @fingerskier/langer tools ensure typescript
+npx -y @fingerskier/langer tools update
+```
+
+(`ensure` alone installs the Go binary; `tools ensure <profile>` installs a language server.)
+
+The package version selects the GitHub release tag (`0.7.0` → `v0.7.0`) unless
 you pass `--version`.
 
 ## What gets written
@@ -56,7 +65,7 @@ MCP entry shape:
 ## Without npm
 
 ```bash
-go install github.com/fingerskier/langer/cmd/langer@v0.1.0
+go install github.com/fingerskier/langer/cmd/langer@v0.7.0
 claude mcp add langer -- langer mcp --stdio
 ```
 

@@ -1,6 +1,10 @@
+import { spawnSync } from "node:child_process";
 import { ensureBinary } from "./download.js";
 import { installIntegration } from "./install.js";
 import { binaryPath, packageVersion, releaseAsset, releaseTag } from "./paths.js";
+
+/** Subcommands of the Go binary; npm ensures the binary then execs it. */
+const BINARY_COMMANDS = new Set(["tools", "status", "daemon", "mcp"]);
 
 /**
  * @param {string[]} args
@@ -29,6 +33,7 @@ export async function runCli(args) {
     return;
   }
 
+  // Installer-only "ensure" (download binary). Not "langer tools ensure …".
   if (command === "ensure") {
     const parsed = parseEnsureArgs(args.slice(1));
     const dest = await ensureBinary(parsed);
@@ -48,10 +53,42 @@ export async function runCli(args) {
     return;
   }
 
+  if (BINARY_COMMANDS.has(command)) {
+    await runLangerBinary(args);
+    return;
+  }
+
   console.error(`Unknown command: ${command}`);
   console.error("");
   console.error(helpText());
   process.exitCode = 1;
+}
+
+/**
+ * Ensure ~/.langer/bin/langer and run it with the given argv (stdio inherited).
+ * @param {string[]} args full argv after npx package name, e.g. ["tools","ensure","typescript"]
+ * @param {{ binary?: string, version?: string, force?: boolean, home?: string }} [opts]
+ */
+export async function runLangerBinary(args, opts = {}) {
+  const dest = await ensureBinary({
+    binary: opts.binary,
+    version: opts.version,
+    force: opts.force,
+    home: opts.home,
+  });
+  const result = spawnSync(dest, args, {
+    stdio: "inherit",
+    windowsHide: true,
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (typeof result.status === "number" && result.status !== 0) {
+    process.exitCode = result.status;
+  }
+  if (result.signal) {
+    process.exitCode = 1;
+  }
 }
 
 export function helpText() {
@@ -61,13 +98,19 @@ export function helpText() {
     "USAGE",
     "  npx -y @fingerskier/langer <command> [options]",
     "",
-    "COMMANDS",
+    "INSTALLER COMMANDS",
     "  install <claude|grok|codex|all>   Download the binary (if needed) and register MCP",
     "  ensure                            Download/install the host binary under ~/.langer/bin",
     "  path                              Print the binary install path",
     "  asset                             Print the GitHub release asset name for this host",
     "  version                           Print this npm package version",
     "  help                              Show this help",
+    "",
+    "BINARY COMMANDS (ensures binary, then runs it)",
+    "  tools list|ensure <id>|update     Managed language-server installs (~/.langer/tools)",
+    "  status                            Daemon / index status for the current workspace",
+    "  mcp --stdio                       MCP frontend (normally via agent MCP config)",
+    "  daemon <root>                     Run the workspace daemon explicitly",
     "",
     "INSTALL OPTIONS",
     "  --scope user|repo     Default: user (home config). repo writes into the current directory.",
@@ -79,8 +122,10 @@ export function helpText() {
     "EXAMPLES",
     "  npx -y @fingerskier/langer install claude --scope user",
     "  npx -y @fingerskier/langer install grok --scope user",
-    "  npx -y @fingerskier/langer install all --scope user --dry-run",
     "  npx -y @fingerskier/langer ensure",
+    "  npx -y @fingerskier/langer tools list",
+    "  npx -y @fingerskier/langer tools ensure typescript",
+    "  npx -y @fingerskier/langer tools update",
     "",
     "Binary releases: https://github.com/fingerskier/langer/releases",
     "Docs: https://github.com/fingerskier/langer#install",

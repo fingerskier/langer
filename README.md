@@ -117,6 +117,9 @@ workspace-local binaries without opt-in).
 langer tools list
 langer tools ensure typescript
 langer tools update
+
+# same via npx (downloads binary if needed, then runs it):
+npx -y @fingerskier/langer tools ensure typescript
 ```
 
 Optional config:
