@@ -252,11 +252,9 @@ func findBin(dir, binName string) (string, error) {
 	if binName == "" {
 		return "", fmt.Errorf("no bin name")
 	}
-	names := []string{binName}
-	if runtime.GOOS == "windows" {
-		base := strings.TrimSuffix(strings.TrimSuffix(binName, ".exe"), ".cmd")
-		names = []string{binName, base + ".exe", base + ".cmd", base + ".ps1", base}
-	}
+	// On Windows, npm's node_modules/.bin/<name> is a POSIX shim (not
+	// CreateProcess-able). Prefer PATHEXT wrappers (.cmd first — npm's default).
+	names := binCandidateNames(binName)
 	// Shallow fixed paths first (npm, go install, plain binary).
 	for _, name := range names {
 		for _, c := range []string{
@@ -264,7 +262,7 @@ func findBin(dir, binName string) (string, error) {
 			filepath.Join(dir, "bin", name),
 			filepath.Join(dir, "node_modules", ".bin", name),
 		} {
-			if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			if isRunnableBinary(c) {
 				return absPath(c), nil
 			}
 		}
@@ -273,6 +271,9 @@ func findBin(dir, binName string) (string, error) {
 	var found string
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !isRunnableBinary(path) {
 			return nil
 		}
 		base := d.Name()
@@ -284,13 +285,11 @@ func findBin(dir, binName string) (string, error) {
 		}
 		// lemminx-win32.exe matches bin "lemminx"
 		if runtime.GOOS == "windows" {
-			for _, name := range names {
-				stem := strings.TrimSuffix(strings.TrimSuffix(name, ".exe"), ".cmd")
-				if strings.HasPrefix(strings.ToLower(base), strings.ToLower(stem)) &&
-					(strings.HasSuffix(strings.ToLower(base), ".exe") || !strings.Contains(base, ".")) {
-					found = path
-					return filepath.SkipAll
-				}
+			stem := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(binName, ".exe"), ".cmd"), ".bat")
+			lb := strings.ToLower(base)
+			if strings.HasPrefix(lb, strings.ToLower(stem)) && filepath.Ext(lb) != "" {
+				found = path
+				return filepath.SkipAll
 			}
 		}
 		return nil
@@ -299,6 +298,49 @@ func findBin(dir, binName string) (string, error) {
 		return absPath(found), nil
 	}
 	return "", fmt.Errorf("bin %q not found under %s", binName, dir)
+}
+
+// binCandidateNames lists filenames to try, best first.
+func binCandidateNames(binName string) []string {
+	if runtime.GOOS != "windows" {
+		return []string{binName}
+	}
+	base := binName
+	for _, suf := range []string{".exe", ".cmd", ".bat", ".com", ".ps1"} {
+		base = strings.TrimSuffix(base, suf)
+		base = strings.TrimSuffix(base, strings.ToUpper(suf))
+	}
+	// Prefer .cmd before bare name: npm always ships .cmd for packages.
+	return []string{
+		base + ".cmd",
+		base + ".exe",
+		base + ".bat",
+		base + ".com",
+		base + ".ps1",
+		// Bare last — almost never CreateProcess-able for Node shims.
+		base,
+	}
+}
+
+// isRunnableBinary is true for a path the OS can exec (PATHEXT on Windows).
+func isRunnableBinary(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || !info.Mode().IsRegular() {
+		return false
+	}
+	if runtime.GOOS != "windows" {
+		return true // mode bits enforced by OS at exec; npm bins are often 755
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return false // extensionless npm shims are not runnable via CreateProcess
+	}
+	for _, allowed := range []string{".cmd", ".exe", ".bat", ".com", ".ps1"} {
+		if ext == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func absPath(p string) string {

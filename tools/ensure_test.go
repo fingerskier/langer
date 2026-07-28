@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,8 +35,14 @@ func (f *fakeInstaller) Install(_ context.Context, req InstallRequest) error {
 	if bin == "" {
 		bin = "server"
 	}
+	if runtime.GOOS == "windows" {
+		// Match real npm/go layout: runnable PATHEXT, not an extensionless shim.
+		if filepath.Ext(bin) == "" {
+			bin = bin + ".cmd"
+		}
+	}
 	path := filepath.Join(dir, "bin", bin)
-	return os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755)
+	return os.WriteFile(path, []byte("@echo off\n"), 0o755)
 }
 
 func TestLoadEmbeddedManifest(t *testing.T) {
@@ -148,6 +156,32 @@ func TestDisabledProfile(t *testing.T) {
 	_, err := mgr.Ensure(context.Background(), "csv")
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestFindBinPrefersWindowsCmdShim(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows npm shim resolution")
+	}
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "node_modules", ".bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// npm layout: extensionless POSIX shim + .cmd launcher
+	if err := os.WriteFile(filepath.Join(binDir, "typescript-language-server"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmdPath := filepath.Join(binDir, "typescript-language-server.cmd")
+	if err := os.WriteFile(cmdPath, []byte("@echo off\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findBin(dir, "typescript-language-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(filepath.Base(got), "typescript-language-server.cmd") {
+		t.Fatalf("findBin = %q, want …typescript-language-server.cmd", got)
 	}
 }
 
