@@ -185,6 +185,29 @@ func TestFindBinPrefersWindowsCmdShim(t *testing.T) {
 	}
 }
 
+// TestFindBinRealManagedTypescript catches plan/Test1.md regression when the
+// user has already run tools ensure typescript on this machine.
+func TestFindBinRealManagedTypescript(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only regression")
+	}
+	root, err := DefaultToolsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := ProfileDir(root, "typescript")
+	if _, err := os.Stat(filepath.Join(dir, "node_modules", ".bin")); err != nil {
+		t.Skipf("no managed typescript install under %s", dir)
+	}
+	got, err := findBin(dir, "typescript-language-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(strings.ToLower(got), ".cmd") {
+		t.Fatalf("managed findBin = %q, want a .cmd path (plan/Test1.md)", got)
+	}
+}
+
 func TestEmbeddedCppCsharpXmlEnabled(t *testing.T) {
 	m, err := LoadManifest()
 	if err != nil {

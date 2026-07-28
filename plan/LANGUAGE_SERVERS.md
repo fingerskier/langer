@@ -13,7 +13,7 @@ Checksums and pinned versions live in the **release tools manifest**, not here.
 | Profile ID | Languages / extensions (indicative) | Primary LS | Install shape (typical) | Notes |
 | --- | --- | --- | --- | --- |
 | `markdown` | `.md`, `.mdx` | **marksman** | GitHub release binary | Outline, links, wiki-style; MDX best-effort |
-| `typescript` | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` | **typescript-language-server** | npm into tools prefix | Needs `tsserver.path`; managed tsserver default, user toml can override |
+| `typescript` | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` | **typescript-language-server** | npm into tools prefix | **JS + TS one profile** (no separate `javascript` entry). Needs `tsserver.path`; managed tsserver default, user toml can override. Root markers include `jsconfig.json`. |
 | `python` | `.py`, `.pyi` | **pyright** | npm (`pyright`) into tools prefix | Covers CPython; MicroPython via same profile + project config/types |
 | `go` | `.go` | **gopls** | Go module / official release into tools prefix | Root markers: `go.mod` |
 | `rust` | `.rs` | **rust-analyzer** | GitHub release binary | Root markers: `Cargo.toml` |
