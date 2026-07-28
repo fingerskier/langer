@@ -4,7 +4,7 @@ import { installIntegration } from "./install.js";
 import { binaryPath, packageVersion, releaseAsset, releaseTag } from "./paths.js";
 
 /** Subcommands of the Go binary; npm ensures the binary then execs it. */
-const BINARY_COMMANDS = new Set(["tools", "status", "daemon", "mcp"]);
+const BINARY_COMMANDS = new Set(["tools", "status", "daemon", "mcp", "stop"]);
 
 /**
  * @param {string[]} args
@@ -126,6 +126,8 @@ export function helpText() {
     "  status                            Daemon / index status for the current workspace",
     "  mcp --stdio                       MCP frontend (normally via agent MCP config)",
     "  daemon <root>                     Run the workspace daemon explicitly",
+    "  stop [root]                       Stop workspace daemon (cwd if root omitted)",
+    "  stop --all|--hard|--nuke          Stop all / force-kill / nuclear kill",
     "",
     "INSTALL OPTIONS",
     "  --scope user|repo     Default: user (home config). repo writes into the current directory.",
@@ -141,6 +143,7 @@ export function helpText() {
     "  npx -y @fingerskier/langer tools list",
     "  npx -y @fingerskier/langer tools ensure typescript",
     "  npx -y @fingerskier/langer tools update",
+    "  npx -y @fingerskier/langer stop --nuke",
     "",
     "Binary releases: https://github.com/fingerskier/langer/releases",
     "Docs: https://github.com/fingerskier/langer#install",

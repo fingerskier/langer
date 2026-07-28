@@ -8,4 +8,6 @@ test("help documents tools proxy and binary ensure distinction", () => {
   assert.match(text, /tools ensure typescript/);
   assert.match(text, /ensure\s+Download\/install the host binary/);
   assert.match(text, /BINARY COMMANDS/);
+  assert.match(text, /stop --all\|--hard\|--nuke/);
+  assert.match(text, /stop --nuke/);
 });
