@@ -19,8 +19,17 @@ func configureCommand(cmd *exec.Cmd, detached bool) {
 		// The auto-started daemon must not share the agent's console or die when
 		// that console closes.
 		flags |= windows.DETACHED_PROCESS
+	} else {
+		// Language servers (and other pipe-backed children) must not open a
+		// visible console. Without CREATE_NO_WINDOW, npm .cmd shims launch via
+		// cmd.exe and steal focus / open a new terminal tab in some hosts.
+		flags |= windows.CREATE_NO_WINDOW
 	}
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: flags}
+	cmd.SysProcAttr = &windows.SysProcAttr{
+		CreationFlags: flags,
+		// Belt-and-suspenders for hosts that still honor STARTF_USESHOWWINDOW.
+		HideWindow: !detached,
+	}
 }
 
 func newProcessController(process *os.Process, detached bool) (processController, error) {
